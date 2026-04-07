@@ -6,12 +6,13 @@ private let logger = Logger(label: "benchmark.raw-postgresql")
 
 /// Direct PostgresNIO operations for baseline benchmarks.
 ///
-/// All operations use explicit transactions (`client.withTransaction`)
-/// to match the framework's transaction model for fair comparison.
+/// Single CRUD operations use auto-commit (no explicit transaction)
+/// since PostgreSQL auto-commits individual statements.
+/// Batch operations use explicit transactions for atomicity.
 /// Raw PostgreSQL uses a relational table with native types.
 enum RawPostgreSQL {
 
-    // MARK: - Table Management (DDL, no transaction needed)
+    // MARK: - Table Management
 
     static func createTable(client: PostgresClient) async throws {
         try await client.query("""
@@ -34,7 +35,7 @@ enum RawPostgreSQL {
         try await client.query("TRUNCATE TABLE benchmark_items", logger: logger)
     }
 
-    // MARK: - CRUD Operations (all use explicit transactions)
+    // MARK: - CRUD Operations (auto-commit, single round-trip)
 
     static func insertOne(
         client: PostgresClient,
@@ -43,30 +44,26 @@ enum RawPostgreSQL {
         age: Int,
         score: Double
     ) async throws {
-        try await client.withTransaction(logger: logger) { connection in
-            try await connection.query("""
-                INSERT INTO benchmark_items (id, name, age, score)
-                VALUES (\(id), \(name), \(age), \(score))
-                """,
-                logger: logger
-            )
-        }
+        try await client.query("""
+            INSERT INTO benchmark_items (id, name, age, score)
+            VALUES (\(id), \(name), \(age), \(score))
+            """,
+            logger: logger
+        )
     }
 
     static func readOne(
         client: PostgresClient,
         id: String
     ) async throws -> (String, String, Int, Double)? {
-        try await client.withTransaction(logger: logger) { connection in
-            let rows = try await connection.query(
-                "SELECT id, name, age, score FROM benchmark_items WHERE id = \(id)",
-                logger: logger
-            )
-            for try await (id, name, age, score) in rows.decode((String, String, Int, Double).self) {
-                return (id, name, age, score)
-            }
-            return nil
+        let rows = try await client.query(
+            "SELECT id, name, age, score FROM benchmark_items WHERE id = \(id)",
+            logger: logger
+        )
+        for try await (id, name, age, score) in rows.decode((String, String, Int, Double).self) {
+            return (id, name, age, score)
         }
+        return nil
     }
 
     static func updateOne(
@@ -76,35 +73,32 @@ enum RawPostgreSQL {
         age: Int,
         score: Double
     ) async throws {
-        try await client.withTransaction(logger: logger) { connection in
-            try await connection.query("""
-                UPDATE benchmark_items
-                SET name = \(name), age = \(age), score = \(score)
-                WHERE id = \(id)
-                """,
-                logger: logger
-            )
-        }
+        try await client.query("""
+            UPDATE benchmark_items
+            SET name = \(name), age = \(age), score = \(score)
+            WHERE id = \(id)
+            """,
+            logger: logger
+        )
     }
 
     static func deleteOne(
         client: PostgresClient,
         id: String
     ) async throws {
-        try await client.withTransaction(logger: logger) { connection in
-            try await connection.query(
-                "DELETE FROM benchmark_items WHERE id = \(id)",
-                logger: logger
-            )
-        }
+        try await client.query(
+            "DELETE FROM benchmark_items WHERE id = \(id)",
+            logger: logger
+        )
     }
 
     // MARK: - Batch Operations
 
     /// Insert multiple items using individual INSERTs within a single transaction.
     ///
-    /// This matches the framework's behavior of individual KV puts within
-    /// one transaction, ensuring a fair comparison of per-item overhead.
+    /// Batch operations need explicit transactions for atomicity across
+    /// multiple statements. This matches the framework's behavior of
+    /// individual KV puts within one transaction.
     static func batchInsert(
         client: PostgresClient,
         items: [(id: String, name: String, age: Int, score: Double)]

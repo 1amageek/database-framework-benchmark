@@ -39,9 +39,7 @@ enum FrameworkPostgreSQL {
 
     static func readOne(container: DBContainer, id: String) async throws -> BenchmarkItem? {
         let context = FDBContext(container: container)
-        return try await context.withTransaction { tx in
-            try await tx.get(BenchmarkItem.self, id: id)
-        }
+        return try await context.model(for: id, as: BenchmarkItem.self)
     }
 
     static func updateOne(container: DBContainer, item: BenchmarkItem) async throws {
