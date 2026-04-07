@@ -1,7 +1,5 @@
 import Foundation
 import BenchmarkFramework
-import PostgresNIO
-import PostgreSQLStorage
 import StorageKit
 import DatabaseEngine
 import Core
@@ -16,7 +14,7 @@ private let logger = Logger(label: "benchmark.profile")
 /// The insert call chain:
 /// ```
 /// FDBContext.init → insert() → save()
-///   → TransactionRunner → StorageEngine.withTransaction
+///   → TransactionRunner → StorageEngine.withAutoCommit
 ///     → ProtobufEncoder.encode()
 ///     → ItemEnvelope.serialize()
 ///     → transaction.setValue()
@@ -27,11 +25,12 @@ private let logger = Logger(label: "benchmark.profile")
 /// This benchmark isolates each layer to find where time is spent:
 ///
 /// ```
-/// Layer 0: Raw PostgreSQL           (native INSERT)
-/// Layer 1: StorageKit KV raw        (transaction + setValue, no serialization)
-/// Layer 2: StorageKit KV + Protobuf (transaction + serialize + setValue)
-/// Layer 3: Full Framework           (FDBContext + save)
+/// Layer 1: Raw KV              (engine.withAutoCommit + setValue, no serialization)
+/// Layer 2: Raw KV + Protobuf   (engine.withAutoCommit + serialize + setValue)
+/// Layer 3: Full Framework       (FDBContext + save)
 /// ```
+///
+/// All layers share the same StorageEngine and connection pool.
 enum ProfileBenchmark {
 
     struct PhaseResult: CustomStringConvertible {
@@ -50,7 +49,7 @@ enum ProfileBenchmark {
 
     static func run(
         runner: BenchmarkRunner,
-        client: PostgresClient,
+        engine: any StorageEngine,
         container: DBContainer
     ) async throws {
         print("")
@@ -59,23 +58,17 @@ enum ProfileBenchmark {
         print(String(repeating: "=", count: 70))
 
         // Clean state
-        try await RawPostgreSQL.truncate(client: client)
+        try await RawKV.cleanup(engine: engine)
         try await FrameworkPostgreSQL.cleanup(container: container)
 
         let strategies: [Strategy] = [
-            ("L0: Raw PostgreSQL", {
+            ("L1: Raw KV (bytes only)", {
                 let id = UUID().uuidString
-                try await RawPostgreSQL.insertOne(
-                    client: client, id: id, name: "Alice", age: 30, score: 85.5
-                )
+                try await storageKitRawWrite(engine: engine, id: id)
             }),
-            ("L1: StorageKit KV (raw bytes)", {
+            ("L2: Raw KV + Protobuf", {
                 let id = UUID().uuidString
-                try await storageKitRawWrite(engine: container.engine, id: id)
-            }),
-            ("L2: StorageKit KV + Protobuf", {
-                let id = UUID().uuidString
-                try await storageKitProtobufWrite(engine: container.engine, id: id)
+                try await storageKitProtobufWrite(engine: engine, id: id)
             }),
             ("L3: Full Framework", {
                 var item = BenchmarkItem()
@@ -105,13 +98,7 @@ enum ProfileBenchmark {
 
         let clock = ContinuousClock()
 
-        // Phase 1: Context creation
-        let contextCreation = try measurePhase(iterations: iterations, clock: clock) {
-            // Requires a container, but we're measuring allocation cost
-            // Use a lightweight substitute
-        }
-
-        // Phase 2: Protobuf serialization
+        // Phase 1: Protobuf serialization
         let encoder = ProtobufEncoder()
         var item = BenchmarkItem()
         item.name = "Alice"
@@ -122,14 +109,14 @@ enum ProfileBenchmark {
             _ = try encoder.encode(item)
         }
 
-        // Phase 3: ItemEnvelope wrapping
+        // Phase 2: ItemEnvelope wrapping
         let sampleData = try Array(encoder.encode(item))
         let envelopeWrap = try measurePhase(iterations: iterations, clock: clock) {
             let envelope = ItemEnvelope.inline(data: sampleData)
             _ = envelope.serialize()
         }
 
-        // Phase 4: DataAccess.serialize (Protobuf + Array conversion)
+        // Phase 3: DataAccess.serialize (Protobuf + Array conversion)
         let dataAccessSerialize = try measurePhase(iterations: iterations, clock: clock) {
             _ = try DataAccess.serialize(item)
         }
@@ -154,7 +141,7 @@ enum ProfileBenchmark {
 
     static func runReadProfile(
         runner: BenchmarkRunner,
-        client: PostgresClient,
+        engine: any StorageEngine,
         container: DBContainer
     ) async throws {
         print("")
@@ -163,17 +150,11 @@ enum ProfileBenchmark {
         print(String(repeating: "=", count: 70))
 
         // Seed data
-        try await RawPostgreSQL.truncate(client: client)
+        try await RawKV.cleanup(engine: engine)
         try await FrameworkPostgreSQL.cleanup(container: container)
 
-        let rawID = "read-profile-raw"
         let fwID = "read-profile-fw"
         let kvID = "read-profile-kv"
-
-        // Seed raw
-        try await RawPostgreSQL.insertOne(
-            client: client, id: rawID, name: "Alice", age: 30, score: 85.5
-        )
 
         // Seed framework
         var fwItem = BenchmarkItem()
@@ -184,14 +165,11 @@ enum ProfileBenchmark {
         try await FrameworkPostgreSQL.insertOne(container: container, item: fwItem)
 
         // Seed KV (raw bytes for L1 read)
-        try await storageKitProtobufWrite(engine: container.engine, id: kvID)
+        try await storageKitProtobufWrite(engine: engine, id: kvID)
 
         let strategies: [Strategy] = [
-            ("L0: Raw PostgreSQL", {
-                _ = try await RawPostgreSQL.readOne(client: client, id: rawID)
-            }),
-            ("L1: StorageKit KV (raw get)", {
-                try await storageKitRawRead(engine: container.engine, id: kvID)
+            ("L1: Raw KV (raw get)", {
+                try await storageKitRawRead(engine: engine, id: kvID)
             }),
             ("L3: Full Framework", {
                 _ = try await FrameworkPostgreSQL.readOne(container: container, id: fwID)
@@ -209,7 +187,7 @@ enum ProfileBenchmark {
 
     static func runDeleteProfile(
         runner: BenchmarkRunner,
-        client: PostgresClient,
+        engine: any StorageEngine,
         container: DBContainer
     ) async throws {
         print("")
@@ -218,17 +196,10 @@ enum ProfileBenchmark {
         print(String(repeating: "=", count: 70))
 
         let strategies: [Strategy] = [
-            ("L0: Raw PostgreSQL", {
+            ("L1: Raw KV", {
                 let id = UUID().uuidString
-                try await RawPostgreSQL.insertOne(
-                    client: client, id: id, name: "Temp", age: 30, score: 50.0
-                )
-                try await RawPostgreSQL.deleteOne(client: client, id: id)
-            }),
-            ("L1: StorageKit KV (raw)", {
-                let id = UUID().uuidString
-                try await storageKitRawWrite(engine: container.engine, id: id)
-                try await storageKitRawDelete(engine: container.engine, id: id)
+                try await storageKitRawWrite(engine: engine, id: id)
+                try await storageKitRawDelete(engine: engine, id: id)
             }),
             ("L3: Full Framework", {
                 let id = UUID().uuidString
@@ -253,7 +224,7 @@ enum ProfileBenchmark {
 
     static func runUpdateProfile(
         runner: BenchmarkRunner,
-        client: PostgresClient,
+        engine: any StorageEngine,
         container: DBContainer
     ) async throws {
         print("")
@@ -261,18 +232,13 @@ enum ProfileBenchmark {
         print("PROFILE: Update Path Layer-by-Layer")
         print(String(repeating: "=", count: 70))
 
-        // Seed one record for each layer
-        try await RawPostgreSQL.truncate(client: client)
+        try await RawKV.cleanup(engine: engine)
         try await FrameworkPostgreSQL.cleanup(container: container)
 
-        let rawID = "update-profile-raw"
         let kvID = "update-profile-kv"
         let fwID = "update-profile-fw"
 
-        try await RawPostgreSQL.insertOne(
-            client: client, id: rawID, name: "Alice", age: 30, score: 85.5
-        )
-        try await storageKitProtobufWrite(engine: container.engine, id: kvID)
+        try await storageKitProtobufWrite(engine: engine, id: kvID)
 
         var fwItem = BenchmarkItem()
         fwItem.id = fwID
@@ -282,15 +248,8 @@ enum ProfileBenchmark {
         try await FrameworkPostgreSQL.insertOne(container: container, item: fwItem)
 
         let strategies: [Strategy] = [
-            ("L0: Raw PostgreSQL", {
-                let v = Int.random(in: 0..<10000)
-                try await RawPostgreSQL.updateOne(
-                    client: client, id: rawID,
-                    name: "Updated \(v)", age: 25 + v, score: 70.0 + Double(v)
-                )
-            }),
-            ("L2: StorageKit KV + Protobuf", {
-                try await storageKitProtobufWrite(engine: container.engine, id: kvID)
+            ("L1: Raw KV (overwrite)", {
+                try await storageKitProtobufWrite(engine: engine, id: kvID)
             }),
             ("L3: Full Framework", {
                 let v = Int.random(in: 0..<10000)
@@ -312,20 +271,16 @@ enum ProfileBenchmark {
 
     // MARK: - StorageKit Direct Operations
 
-    /// Layer 1: Raw KV write through StorageKit (no serialization overhead).
-    /// Writes a fixed-size byte array directly to the KV store.
+    /// Layer 1: Raw KV write (no serialization overhead, auto-commit).
     private static func storageKitRawWrite(engine: any StorageEngine, id: String) async throws {
-        // Pre-computed key and value (skip serialization cost)
         let key: [UInt8] = Array("benchmark/items/\(id)".utf8)
-        // ~50 bytes to match typical BenchmarkItem protobuf size
-        let value: [UInt8] = Array(repeating: 0x42, count: 50)
-
-        try await engine.withTransaction { tx in
+        let value: [UInt8] = Array(repeating: 0x42, count: 70)
+        try await engine.withAutoCommit { tx in
             tx.setValue(value, for: key)
         }
     }
 
-    /// Layer 2: KV write with Protobuf serialization + ItemEnvelope.
+    /// Layer 2: KV write with Protobuf serialization + ItemEnvelope (auto-commit).
     private static func storageKitProtobufWrite(engine: any StorageEngine, id: String) async throws {
         var item = BenchmarkItem()
         item.id = id
@@ -338,23 +293,23 @@ enum ProfileBenchmark {
         let serialized = envelope.serialize()
         let key: [UInt8] = Array("benchmark/items/\(id)".utf8)
 
-        try await engine.withTransaction { tx in
+        try await engine.withAutoCommit { tx in
             tx.setValue(serialized, for: key)
         }
     }
 
-    /// Layer 1 delete: Raw KV delete through StorageKit.
+    /// Layer 1 delete: Raw KV delete (auto-commit).
     private static func storageKitRawDelete(engine: any StorageEngine, id: String) async throws {
         let key: [UInt8] = Array("benchmark/items/\(id)".utf8)
-        try await engine.withTransaction { tx in
+        try await engine.withAutoCommit { tx in
             tx.clear(key: key)
         }
     }
 
-    /// Layer 1 read: Raw KV get through StorageKit.
+    /// Layer 1 read: Raw KV get (auto-commit).
     private static func storageKitRawRead(engine: any StorageEngine, id: String) async throws {
         let key: [UInt8] = Array("benchmark/items/\(id)".utf8)
-        try await engine.withTransaction { tx in
+        try await engine.withAutoCommit { tx in
             _ = try await tx.getValue(for: key, snapshot: false)
         }
     }

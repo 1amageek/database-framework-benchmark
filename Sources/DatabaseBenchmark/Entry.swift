@@ -2,6 +2,7 @@ import Foundation
 import BenchmarkFramework
 import PostgresNIO
 import PostgreSQLStorage
+import StorageKit
 import DatabaseEngine
 import Core
 
@@ -23,15 +24,29 @@ struct BenchmarkApp {
             group.addTask { await client.run() }
 
             let container = try await FrameworkPostgreSQL.makeContainer(config: config)
+            let engine = container.engine
 
             let runner = BenchmarkRunner(config: .init(
-                warmupIterations: 5,
-                measurementIterations: 50,
+                warmupIterations: 10,
+                measurementIterations: 100,
                 throughputDuration: 5.0
             ))
 
-            // Prepare raw table
-            try await RawPostgreSQL.createTable(client: client)
+            // Warm up connection pool and PostgreSQL caches before any measurement.
+            // This prevents execution-order bias where the second strategy benefits
+            // from caches warmed by the first strategy's throughput phase.
+            print("Warming up connection pool...")
+            for _ in 0..<100 {
+                try await RawKV.insertOne(engine: engine, id: UUID().uuidString)
+            }
+            for _ in 0..<100 {
+                var item = BenchmarkItem()
+                item.name = "warmup"
+                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+            }
+            try await RawKV.cleanup(engine: engine)
+            try await FrameworkPostgreSQL.cleanup(container: container)
+            print("Warmup complete.\n")
 
             // Parse run mode from arguments
             let args = CommandLine.arguments
@@ -43,30 +58,30 @@ struct BenchmarkApp {
             if profileOnly || runAll {
                 try ProfileBenchmark.runPhaseBreakdown()
                 try await ProfileBenchmark.run(
-                    runner: runner, client: client, container: container
+                    runner: runner, engine: engine, container: container
                 )
                 try await ProfileBenchmark.runReadProfile(
-                    runner: runner, client: client, container: container
+                    runner: runner, engine: engine, container: container
                 )
                 try await ProfileBenchmark.runUpdateProfile(
-                    runner: runner, client: client, container: container
+                    runner: runner, engine: engine, container: container
                 )
                 try await ProfileBenchmark.runDeleteProfile(
-                    runner: runner, client: client, container: container
+                    runner: runner, engine: engine, container: container
                 )
             }
 
             // --- Comparison Benchmarks ---
             if compareOnly || runAll {
-                try await runSingleInsertBenchmark(runner: runner, client: client, container: container)
-                try await runBatchInsertBenchmark(runner: runner, client: client, container: container, batchSize: 100)
-                try await runPointReadBenchmark(runner: runner, client: client, container: container)
-                try await runUpdateBenchmark(runner: runner, client: client, container: container)
-                try await runDeleteBenchmark(runner: runner, client: client, container: container)
+                try await runSingleInsertBenchmark(runner: runner, engine: engine, container: container)
+                try await runBatchInsertBenchmark(runner: runner, engine: engine, container: container, batchSize: 100)
+                try await runPointReadBenchmark(runner: runner, engine: engine, container: container)
+                try await runUpdateBenchmark(runner: runner, engine: engine, container: container)
+                try await runDeleteBenchmark(runner: runner, engine: engine, container: container)
             }
 
             // Cleanup
-            try await RawPostgreSQL.dropTable(client: client)
+            try await RawKV.cleanup(engine: engine)
             try await FrameworkPostgreSQL.cleanup(container: container)
             group.cancelAll()
         }
@@ -79,18 +94,16 @@ struct BenchmarkApp {
 
 private func runSingleInsertBenchmark(
     runner: BenchmarkRunner,
-    client: PostgresClient,
+    engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawPostgreSQL.truncate(client: client)
+    try await RawKV.cleanup(engine: engine)
     try await FrameworkPostgreSQL.cleanup(container: container)
 
     let strategies: [Strategy] = [
-        ("Raw PostgreSQL", {
+        ("Raw KV", {
             let id = UUID().uuidString
-            try await RawPostgreSQL.insertOne(
-                client: client, id: id, name: "Alice", age: 30, score: 85.5
-            )
+            try await RawKV.insertOne(engine: engine, id: id)
         }),
         ("DatabaseFramework", {
             var item = BenchmarkItem()
@@ -106,26 +119,17 @@ private func runSingleInsertBenchmark(
 
 private func runBatchInsertBenchmark(
     runner: BenchmarkRunner,
-    client: PostgresClient,
+    engine: any StorageEngine,
     container: DBContainer,
     batchSize: Int
 ) async throws {
-    try await RawPostgreSQL.truncate(client: client)
+    try await RawKV.cleanup(engine: engine)
     try await FrameworkPostgreSQL.cleanup(container: container)
 
     let size = batchSize
     let strategies: [Strategy] = [
-        ("Raw PostgreSQL", {
-            var items: [(id: String, name: String, age: Int, score: Double)] = []
-            for i in 0..<size {
-                items.append((
-                    id: UUID().uuidString,
-                    name: "User \(i)",
-                    age: 20 + (i % 60),
-                    score: Double(50 + (i % 50))
-                ))
-            }
-            try await RawPostgreSQL.batchInsert(client: client, items: items)
+        ("Raw KV", {
+            try await RawKV.batchInsert(engine: engine, count: size)
         }),
         ("DatabaseFramework", {
             var items: [BenchmarkItem] = []
@@ -145,22 +149,22 @@ private func runBatchInsertBenchmark(
 
 private func runPointReadBenchmark(
     runner: BenchmarkRunner,
-    client: PostgresClient,
+    engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawPostgreSQL.truncate(client: client)
+    try await RawKV.cleanup(engine: engine)
     try await FrameworkPostgreSQL.cleanup(container: container)
 
     let seedCount = 1000
-    let rawIDs = try await RawPostgreSQL.seedData(client: client, count: seedCount)
+    let rawIDs = try await RawKV.seedData(engine: engine, count: seedCount)
     let frameworkIDs = try await FrameworkPostgreSQL.seedData(container: container, count: seedCount)
 
     let rawTargetID = rawIDs[seedCount / 2]
     let fwTargetID = frameworkIDs[seedCount / 2]
 
     let strategies: [Strategy] = [
-        ("Raw PostgreSQL", {
-            _ = try await RawPostgreSQL.readOne(client: client, id: rawTargetID)
+        ("Raw KV", {
+            _ = try await RawKV.readOne(engine: engine, id: rawTargetID)
         }),
         ("DatabaseFramework", {
             _ = try await FrameworkPostgreSQL.readOne(container: container, id: fwTargetID)
@@ -172,15 +176,15 @@ private func runPointReadBenchmark(
 
 private func runUpdateBenchmark(
     runner: BenchmarkRunner,
-    client: PostgresClient,
+    engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawPostgreSQL.truncate(client: client)
+    try await RawKV.cleanup(engine: engine)
     try await FrameworkPostgreSQL.cleanup(container: container)
 
     let rawID = "update-target-raw"
     let fwID = "update-target-fw"
-    try await RawPostgreSQL.insertOne(client: client, id: rawID, name: "Original", age: 25, score: 70.0)
+    try await RawKV.insertOne(engine: engine, id: rawID)
 
     var fwItem = BenchmarkItem()
     fwItem.id = fwID
@@ -190,12 +194,8 @@ private func runUpdateBenchmark(
     try await FrameworkPostgreSQL.insertOne(container: container, item: fwItem)
 
     let strategies: [Strategy] = [
-        ("Raw PostgreSQL", {
-            let variation = Int.random(in: 0..<10000)
-            try await RawPostgreSQL.updateOne(
-                client: client, id: rawID,
-                name: "Updated \(variation)", age: 25 + variation, score: 70.0 + Double(variation)
-            )
+        ("Raw KV", {
+            try await RawKV.updateOne(engine: engine, id: rawID)
         }),
         ("DatabaseFramework", {
             let variation = Int.random(in: 0..<10000)
@@ -213,17 +213,17 @@ private func runUpdateBenchmark(
 
 private func runDeleteBenchmark(
     runner: BenchmarkRunner,
-    client: PostgresClient,
+    engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawPostgreSQL.truncate(client: client)
+    try await RawKV.cleanup(engine: engine)
     try await FrameworkPostgreSQL.cleanup(container: container)
 
     let strategies: [Strategy] = [
-        ("Raw PostgreSQL", {
+        ("Raw KV", {
             let id = UUID().uuidString
-            try await RawPostgreSQL.insertOne(client: client, id: id, name: "Temp", age: 30, score: 50.0)
-            try await RawPostgreSQL.deleteOne(client: client, id: id)
+            try await RawKV.insertOne(engine: engine, id: id)
+            try await RawKV.deleteOne(engine: engine, id: id)
         }),
         ("DatabaseFramework", {
             let id = UUID().uuidString
