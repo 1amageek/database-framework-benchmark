@@ -33,11 +33,31 @@ struct BenchmarkApp {
             // Prepare raw table
             try await RawPostgreSQL.createTable(client: client)
 
-            try await runSingleInsertBenchmark(runner: runner, client: client, container: container)
-            try await runBatchInsertBenchmark(runner: runner, client: client, container: container, batchSize: 100)
-            try await runPointReadBenchmark(runner: runner, client: client, container: container)
-            try await runUpdateBenchmark(runner: runner, client: client, container: container)
-            try await runDeleteBenchmark(runner: runner, client: client, container: container)
+            // Parse run mode from arguments
+            let args = CommandLine.arguments
+            let profileOnly = args.contains("--profile")
+            let compareOnly = args.contains("--compare")
+            let runAll = !profileOnly && !compareOnly
+
+            // --- Profile Benchmarks ---
+            if profileOnly || runAll {
+                try ProfileBenchmark.runPhaseBreakdown()
+                try await ProfileBenchmark.run(
+                    runner: runner, client: client, container: container
+                )
+                try await ProfileBenchmark.runReadProfile(
+                    runner: runner, client: client, container: container
+                )
+            }
+
+            // --- Comparison Benchmarks ---
+            if compareOnly || runAll {
+                try await runSingleInsertBenchmark(runner: runner, client: client, container: container)
+                try await runBatchInsertBenchmark(runner: runner, client: client, container: container, batchSize: 100)
+                try await runPointReadBenchmark(runner: runner, client: client, container: container)
+                try await runUpdateBenchmark(runner: runner, client: client, container: container)
+                try await runDeleteBenchmark(runner: runner, client: client, container: container)
+            }
 
             // Cleanup
             try await RawPostgreSQL.dropTable(client: client)
