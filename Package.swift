@@ -10,6 +10,7 @@ let package = Package(
         .package(url: "https://github.com/1amageek/database-kit.git", from: "26.0324.0"),
         .package(url: "https://github.com/1amageek/storage-kit.git", from: "26.0324.0", traits: ["PostgreSQL"]),
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.25.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.7.0"),
     ],
     targets: [
         .executableTarget(
@@ -22,6 +23,7 @@ let package = Package(
                 .product(name: "StorageKit", package: "storage-kit"),
                 .product(name: "PostgreSQLStorage", package: "storage-kit"),
                 .product(name: "PostgresNIO", package: "postgres-nio"),
+                .product(name: "Logging", package: "swift-log"),
             ]
         ),
     ]

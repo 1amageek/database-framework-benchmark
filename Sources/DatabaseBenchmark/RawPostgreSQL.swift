@@ -1,13 +1,17 @@
 import Foundation
 import PostgresNIO
+import Logging
+
+private let logger = Logger(label: "benchmark.raw-postgresql")
 
 /// Direct PostgresNIO operations for baseline benchmarks.
 ///
-/// Uses a relational table with native PostgreSQL types and indexes,
-/// representing the best-case performance without any framework overhead.
+/// All operations use explicit transactions (`client.withTransaction`)
+/// to match the framework's transaction model for fair comparison.
+/// Raw PostgreSQL uses a relational table with native types.
 enum RawPostgreSQL {
 
-    // MARK: - Table Management
+    // MARK: - Table Management (DDL, no transaction needed)
 
     static func createTable(client: PostgresClient) async throws {
         try await client.query("""
@@ -17,18 +21,20 @@ enum RawPostgreSQL {
                 age INT NOT NULL,
                 score DOUBLE PRECISION NOT NULL
             )
-            """)
+            """,
+            logger: logger
+        )
     }
 
     static func dropTable(client: PostgresClient) async throws {
-        try await client.query("DROP TABLE IF EXISTS benchmark_items")
+        try await client.query("DROP TABLE IF EXISTS benchmark_items", logger: logger)
     }
 
     static func truncate(client: PostgresClient) async throws {
-        try await client.query("TRUNCATE TABLE benchmark_items")
+        try await client.query("TRUNCATE TABLE benchmark_items", logger: logger)
     }
 
-    // MARK: - CRUD Operations
+    // MARK: - CRUD Operations (all use explicit transactions)
 
     static func insertOne(
         client: PostgresClient,
@@ -37,23 +43,30 @@ enum RawPostgreSQL {
         age: Int,
         score: Double
     ) async throws {
-        try await client.query("""
-            INSERT INTO benchmark_items (id, name, age, score)
-            VALUES (\(id), \(name), \(age), \(score))
-            """)
+        try await client.withTransaction(logger: logger) { connection in
+            try await connection.query("""
+                INSERT INTO benchmark_items (id, name, age, score)
+                VALUES (\(id), \(name), \(age), \(score))
+                """,
+                logger: logger
+            )
+        }
     }
 
     static func readOne(
         client: PostgresClient,
         id: String
     ) async throws -> (String, String, Int, Double)? {
-        let rows = try await client.query(
-            "SELECT id, name, age, score FROM benchmark_items WHERE id = \(id)"
-        )
-        for try await (id, name, age, score) in rows.decode((String, String, Int, Double).self) {
-            return (id, name, age, score)
+        try await client.withTransaction(logger: logger) { connection in
+            let rows = try await connection.query(
+                "SELECT id, name, age, score FROM benchmark_items WHERE id = \(id)",
+                logger: logger
+            )
+            for try await (id, name, age, score) in rows.decode((String, String, Int, Double).self) {
+                return (id, name, age, score)
+            }
+            return nil
         }
-        return nil
     }
 
     static func updateOne(
@@ -63,45 +76,55 @@ enum RawPostgreSQL {
         age: Int,
         score: Double
     ) async throws {
-        try await client.query("""
-            UPDATE benchmark_items
-            SET name = \(name), age = \(age), score = \(score)
-            WHERE id = \(id)
-            """)
+        try await client.withTransaction(logger: logger) { connection in
+            try await connection.query("""
+                UPDATE benchmark_items
+                SET name = \(name), age = \(age), score = \(score)
+                WHERE id = \(id)
+                """,
+                logger: logger
+            )
+        }
     }
 
     static func deleteOne(
         client: PostgresClient,
         id: String
     ) async throws {
-        try await client.query("DELETE FROM benchmark_items WHERE id = \(id)")
+        try await client.withTransaction(logger: logger) { connection in
+            try await connection.query(
+                "DELETE FROM benchmark_items WHERE id = \(id)",
+                logger: logger
+            )
+        }
     }
 
     // MARK: - Batch Operations
 
-    /// Insert multiple items in a single multi-row VALUES statement.
+    /// Insert multiple items using individual INSERTs within a single transaction.
     ///
-    /// NOTE: Uses `unsafeSQL` for dynamic query construction.
-    /// This is acceptable for benchmarks with controlled data but should
-    /// never be used in production code.
+    /// This matches the framework's behavior of individual KV puts within
+    /// one transaction, ensuring a fair comparison of per-item overhead.
     static func batchInsert(
         client: PostgresClient,
         items: [(id: String, name: String, age: Int, score: Double)]
     ) async throws {
         guard !items.isEmpty else { return }
-        var values: [String] = []
-        for item in items {
-            let escaped = item.name.replacingOccurrences(of: "'", with: "''")
-            values.append("('\(item.id)', '\(escaped)', \(item.age), \(item.score))")
+        try await client.withTransaction(logger: logger) { connection in
+            for item in items {
+                try await connection.query("""
+                    INSERT INTO benchmark_items (id, name, age, score)
+                    VALUES (\(item.id), \(item.name), \(item.age), \(item.score))
+                    """,
+                    logger: logger
+                )
+            }
         }
-        let sql = "INSERT INTO benchmark_items (id, name, age, score) VALUES " + values.joined(separator: ", ")
-        try await client.query(PostgresQuery(unsafeSQL: sql))
     }
 
-    // MARK: - Seed Data
+    // MARK: - Seed Data (setup, not measured)
 
     /// Populate the table with N records for read/update/delete benchmarks.
-    /// Returns the IDs of the inserted records.
     @discardableResult
     static func seedData(
         client: PostgresClient,
