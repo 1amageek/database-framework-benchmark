@@ -48,6 +48,12 @@ struct BenchmarkApp {
                 try await ProfileBenchmark.runReadProfile(
                     runner: runner, client: client, container: container
                 )
+                try await ProfileBenchmark.runUpdateProfile(
+                    runner: runner, client: client, container: container
+                )
+                try await ProfileBenchmark.runDeleteProfile(
+                    runner: runner, client: client, container: container
+                )
             }
 
             // --- Comparison Benchmarks ---

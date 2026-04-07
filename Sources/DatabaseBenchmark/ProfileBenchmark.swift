@@ -205,6 +205,111 @@ enum ProfileBenchmark {
         printDeltaAnalysis(result)
     }
 
+    // MARK: - Delete Path Profile
+
+    static func runDeleteProfile(
+        runner: BenchmarkRunner,
+        client: PostgresClient,
+        container: DBContainer
+    ) async throws {
+        print("")
+        print(String(repeating: "=", count: 70))
+        print("PROFILE: Delete Path Layer-by-Layer")
+        print(String(repeating: "=", count: 70))
+
+        let strategies: [Strategy] = [
+            ("L0: Raw PostgreSQL", {
+                let id = UUID().uuidString
+                try await RawPostgreSQL.insertOne(
+                    client: client, id: id, name: "Temp", age: 30, score: 50.0
+                )
+                try await RawPostgreSQL.deleteOne(client: client, id: id)
+            }),
+            ("L1: StorageKit KV (raw)", {
+                let id = UUID().uuidString
+                try await storageKitRawWrite(engine: container.engine, id: id)
+                try await storageKitRawDelete(engine: container.engine, id: id)
+            }),
+            ("L3: Full Framework", {
+                let id = UUID().uuidString
+                var item = BenchmarkItem()
+                item.id = id
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+                try await FrameworkPostgreSQL.deleteOne(container: container, id: id)
+            }),
+        ]
+        let result = try await runner.compareStrategies(
+            name: "Insert+Delete: Layer-by-Layer",
+            strategies: strategies
+        )
+        ConsoleReporter.print(result)
+        printDeltaAnalysis(result)
+    }
+
+    // MARK: - Update Path Profile
+
+    static func runUpdateProfile(
+        runner: BenchmarkRunner,
+        client: PostgresClient,
+        container: DBContainer
+    ) async throws {
+        print("")
+        print(String(repeating: "=", count: 70))
+        print("PROFILE: Update Path Layer-by-Layer")
+        print(String(repeating: "=", count: 70))
+
+        // Seed one record for each layer
+        try await RawPostgreSQL.truncate(client: client)
+        try await FrameworkPostgreSQL.cleanup(container: container)
+
+        let rawID = "update-profile-raw"
+        let kvID = "update-profile-kv"
+        let fwID = "update-profile-fw"
+
+        try await RawPostgreSQL.insertOne(
+            client: client, id: rawID, name: "Alice", age: 30, score: 85.5
+        )
+        try await storageKitProtobufWrite(engine: container.engine, id: kvID)
+
+        var fwItem = BenchmarkItem()
+        fwItem.id = fwID
+        fwItem.name = "Alice"
+        fwItem.age = 30
+        fwItem.score = 85.5
+        try await FrameworkPostgreSQL.insertOne(container: container, item: fwItem)
+
+        let strategies: [Strategy] = [
+            ("L0: Raw PostgreSQL", {
+                let v = Int.random(in: 0..<10000)
+                try await RawPostgreSQL.updateOne(
+                    client: client, id: rawID,
+                    name: "Updated \(v)", age: 25 + v, score: 70.0 + Double(v)
+                )
+            }),
+            ("L2: StorageKit KV + Protobuf", {
+                try await storageKitProtobufWrite(engine: container.engine, id: kvID)
+            }),
+            ("L3: Full Framework", {
+                let v = Int.random(in: 0..<10000)
+                var item = BenchmarkItem()
+                item.id = fwID
+                item.name = "Updated \(v)"
+                item.age = 25 + v
+                item.score = 70.0 + Double(v)
+                try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+            }),
+        ]
+        let result = try await runner.compareStrategies(
+            name: "Update: Layer-by-Layer",
+            strategies: strategies
+        )
+        ConsoleReporter.print(result)
+        printDeltaAnalysis(result)
+    }
+
     // MARK: - StorageKit Direct Operations
 
     /// Layer 1: Raw KV write through StorageKit (no serialization overhead).
@@ -235,6 +340,14 @@ enum ProfileBenchmark {
 
         try await engine.withTransaction { tx in
             tx.setValue(serialized, for: key)
+        }
+    }
+
+    /// Layer 1 delete: Raw KV delete through StorageKit.
+    private static func storageKitRawDelete(engine: any StorageEngine, id: String) async throws {
+        let key: [UInt8] = Array("benchmark/items/\(id)".utf8)
+        try await engine.withTransaction { tx in
+            tx.clear(key: key)
         }
     }
 
