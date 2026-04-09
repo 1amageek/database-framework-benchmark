@@ -24,8 +24,10 @@ enum FrameworkPostgreSQL {
 
     /// Clear all framework data from the KV store.
     static func cleanup(container: DBContainer) async throws {
+        let subspace = try await container.resolveDirectory(for: BenchmarkItem.self)
+        let (begin, end) = subspace.range()
         try await container.engine.withTransaction { tx in
-            tx.clearRange(beginKey: [0x00], endKey: [0xFF, 0xFF])
+            tx.clearRange(beginKey: begin, endKey: end)
         }
     }
 
@@ -74,7 +76,8 @@ enum FrameworkPostgreSQL {
     @discardableResult
     static func seedData(
         container: DBContainer,
-        count: Int
+        count: Int,
+        idPrefix: String = "seed"
     ) async throws -> [String] {
         var ids: [String] = []
         let batchSize = 100
@@ -82,7 +85,7 @@ enum FrameworkPostgreSQL {
             let end = min(batchStart + batchSize, count)
             let context = FDBContext(container: container)
             for i in batchStart..<end {
-                let id = "seed-\(String(format: "%06d", i))"
+                let id = "\(idPrefix)-\(String(format: "%06d", i))"
                 ids.append(id)
                 var item = BenchmarkItem()
                 item.id = id

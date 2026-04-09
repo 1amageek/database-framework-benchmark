@@ -62,14 +62,18 @@ enum RawKV {
     // MARK: - Seed Data
 
     @discardableResult
-    static func seedData(engine: any StorageEngine, count: Int) async throws -> [String] {
+    static func seedData(
+        engine: any StorageEngine,
+        count: Int,
+        idPrefix: String = "seed"
+    ) async throws -> [String] {
         var ids: [String] = []
         let batchSize = 100
         for batchStart in stride(from: 0, to: count, by: batchSize) {
             let end = min(batchStart + batchSize, count)
             try await engine.withTransaction { tx in
                 for i in batchStart..<end {
-                    let id = "seed-\(String(format: "%06d", i))"
+                    let id = "\(idPrefix)-\(String(format: "%06d", i))"
                     ids.append(id)
                     tx.setValue(precomputedValue, for: makeKeyBytes(id: id))
                 }
