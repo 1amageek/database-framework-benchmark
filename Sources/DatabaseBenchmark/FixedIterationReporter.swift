@@ -54,6 +54,36 @@ enum FixedIterationReporter {
         return measurements
     }
 
+    static func print(
+        title: String,
+        summaries: [MeasurementSummary],
+        iterations: Int = 200,
+        rounds: Int = 1
+    ) {
+        Swift.print("  \(title)")
+        let header = rounds > 1
+            ? "  Fixed Iteration Avg (\(iterations) iterations, median of \(rounds) rounds)"
+            : "  Fixed Iteration Avg (\(iterations) iterations)"
+        Swift.print(header)
+        Swift.print("  " + String(repeating: "-", count: 52))
+        let nameWidth = max(28, summaries.map(\.name.count).max() ?? 0)
+        for measurement in summaries {
+            let padded = measurement.name.padding(toLength: nameWidth, withPad: " ", startingAt: 0)
+            Swift.print("  \(padded) \(String(format: "%8.1f", measurement.averageMicros)) us/op")
+        }
+        Swift.print("")
+
+        if let baseline = summaries.first {
+            for measurement in summaries.dropFirst() {
+                let deltaMicros = measurement.averageMicros - baseline.averageMicros
+                Swift.print(
+                    "  Delta vs \(baseline.name): \(measurement.name) \(String(format: "%+.1f", deltaMicros)) us/op"
+                )
+            }
+            Swift.print("")
+        }
+    }
+
     private static func measure(
         name: String,
         iterations: Int,

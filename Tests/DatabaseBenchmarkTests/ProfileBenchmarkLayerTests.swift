@@ -115,21 +115,31 @@ struct ProfileBenchmarkLayerTests {
     @Test("layer labels are stable and explicit about their contracts")
     func layerLabelsAreStable() {
         #expect(BenchmarkLayerContract.rawKV == "Raw KV")
-        #expect(BenchmarkLayerContract.dataStoreParity == "DataStore parity")
         #expect(BenchmarkLayerContract.fullFramework == "Full Framework")
+        #expect(BenchmarkLayerContract.writeStorageParityBaseline == "Storage parity baseline")
+        #expect(BenchmarkLayerContract.genericDataStoreBatchPath == "Generic DataStore batch path")
+        #expect(BenchmarkLayerContract.fullFrameworkProductPath == "Full Framework (product path)")
         #expect(BenchmarkLayerContract.writeL1 == "L1: Raw KV (ad hoc key, bytes only)")
         #expect(BenchmarkLayerContract.readL1 == "L1: Raw KV (framework key only)")
         #expect(BenchmarkLayerContract.l2 == "L2: Raw KV + framework layout + storage stack")
-        #expect(BenchmarkLayerContract.l3 == "L3: Full Framework")
+        #expect(BenchmarkLayerContract.writeL3 == "L3: Generic DataStore batch path")
+        #expect(BenchmarkLayerContract.writeL4 == "L4: Full Framework product path")
         #expect(BenchmarkLayerContract.pointReadPresenceBaseline == "Raw KV (presence only)")
         #expect(BenchmarkLayerContract.pointReadDecodeParity == "Raw KV + storage-stack decode parity")
         #expect(BenchmarkLayerContract.readDataStoreParity == "DataStore.fetch() parity")
-        #expect(BenchmarkLayerContract.updateDataStoreParity == "DataStore.executeBatch() parity")
-        #expect(BenchmarkLayerContract.deleteDataStoreParity == "DataStore.executeBatch() parity")
+        #expect(BenchmarkLayerContract.genericDataStoreBatchPathProfile == "Generic DataStore batch path")
+        #expect(BenchmarkLayerContract.fullFrameworkProductPathProfile == "Full Framework product path")
         #expect(BenchmarkLayerContract.reusedContextParity == "FDBContext parity (reused)")
         #expect(BenchmarkLayerContract.freshContextParity == "FDBContext parity (fresh)")
         #expect(BenchmarkLayerContract.l1ToL2Description == "framework layout + storage stack")
-        #expect(BenchmarkLayerContract.l2ToL3Description == "DataStore/FDBContext abstraction")
+        #expect(BenchmarkLayerContract.writeL2ToL3Description == "generic batch abstraction delta")
+        #expect(BenchmarkLayerContract.writeL3ToL4Description == "product fast-path delta")
+        #expect(BenchmarkLayerContract.readL2ToL3Description == "storage parity")
+        #expect(BenchmarkLayerContract.readL3ToL4Description == "context parity")
+        #expect(BenchmarkLayerContract.productParitySummary == "Product parity summary")
+        #expect(BenchmarkLayerContract.diagnosticBreakdown == "Diagnostic breakdown")
+        #expect(BenchmarkLayerContract.storageParitySummary == "Storage Parity Summary")
+        #expect(BenchmarkLayerContract.contextParitySummary == "Context Parity Summary")
         #expect(BenchmarkLayerContract.readProfileLabels == [
             BenchmarkLayerContract.readL1,
             BenchmarkLayerContract.l2,
@@ -142,17 +152,23 @@ struct ProfileBenchmarkLayerTests {
             BenchmarkLayerContract.readDataStoreParity,
             BenchmarkLayerContract.fullFramework,
         ])
+        #expect(BenchmarkLayerContract.writeCompareLabels == [
+            BenchmarkLayerContract.rawKV,
+            BenchmarkLayerContract.writeStorageParityBaseline,
+            BenchmarkLayerContract.genericDataStoreBatchPath,
+            BenchmarkLayerContract.fullFrameworkProductPath,
+        ])
         #expect(BenchmarkLayerContract.writeProfileLabels == [
             BenchmarkLayerContract.writeL1,
             BenchmarkLayerContract.l2,
-            BenchmarkLayerContract.updateDataStoreParity,
-            BenchmarkLayerContract.fullFramework,
+            BenchmarkLayerContract.writeL3,
+            BenchmarkLayerContract.writeL4,
         ])
         #expect(BenchmarkLayerContract.deleteProfileLabels == [
             BenchmarkLayerContract.writeL1,
             BenchmarkLayerContract.l2,
-            BenchmarkLayerContract.deleteDataStoreParity,
-            BenchmarkLayerContract.fullFramework,
+            BenchmarkLayerContract.writeL3,
+            BenchmarkLayerContract.writeL4,
         ])
     }
 }

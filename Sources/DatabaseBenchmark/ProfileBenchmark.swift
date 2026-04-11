@@ -4,6 +4,7 @@ import StorageKit
 import DatabaseEngine
 import Core
 import Logging
+import Synchronization
 
 private let logger = Logger(label: "benchmark.profile")
 
@@ -27,11 +28,53 @@ private let logger = Logger(label: "benchmark.profile")
 /// ```
 /// Layer 1: Raw KV (ad hoc key, bytes only)                  - minimum raw baseline
 /// Layer 2: Raw KV + framework layout + storage stack        - layout + DataAccess + ItemStorage
-/// Layer 3: Full Framework                                   - DataStore + FDBContext
+/// Layer 3: Generic DataStore batch path                     - internal generic batch path
+/// Layer 4: Full Framework product path                      - FDBContext.save() fast path
 /// ```
 ///
 /// All layers share the same StorageEngine and connection pool.
 enum ProfileBenchmark {
+    private final class IterationIDPool: Sendable {
+        private let ids: [String]
+        private let state: Mutex<Int>
+
+        init(ids: [String]) {
+            self.ids = ids
+            self.state = Mutex(0)
+        }
+
+        func next() -> String {
+            state.withLock { index in
+                let id = ids[index % ids.count]
+                index += 1
+                return id
+            }
+        }
+    }
+
+    private struct PoolRoundState: Sendable {
+        let pool: IterationIDPool
+    }
+
+    private struct ContextRoundState: Sendable {
+        let pool: IterationIDPool
+        let context: FDBContext
+    }
+
+    private struct DataStoreRoundState: Sendable {
+        let store: any DataStore
+    }
+
+    private struct DataStorePoolRoundState: Sendable {
+        let store: any DataStore
+        let pool: IterationIDPool
+    }
+
+    private struct DeleteContextRoundState: Sendable {
+        let insertContext: FDBContext
+        let deleteContext: FDBContext
+    }
+
     struct BenchmarkStorageLayout: Sendable {
         let itemSubspace: Subspace
         let blobsSubspace: Subspace
@@ -69,6 +112,7 @@ enum ProfileBenchmark {
         try await RawKV.cleanup(engine: engine)
         try await FrameworkPostgreSQL.cleanup(container: container)
         let layout = try await benchmarkStorageLayout(container: container)
+        let reusedStore = try await container.store(for: BenchmarkItem.self)
 
         let strategies: [Strategy] = [
             (BenchmarkLayerContract.writeL1, {
@@ -84,7 +128,14 @@ enum ProfileBenchmark {
                     isNewRecord: true
                 )
             }),
-            (BenchmarkLayerContract.l3, {
+            (BenchmarkLayerContract.writeL3, {
+                var item = BenchmarkItem()
+                item.name = "Alice"
+                item.age = 30
+                item.score = 85.5
+                try await reusedStore.executeBatch(inserts: [item], deletes: [])
+            }),
+            (BenchmarkLayerContract.writeL4, {
                 var item = BenchmarkItem()
                 item.name = "Alice"
                 item.age = 30
@@ -97,10 +148,26 @@ enum ProfileBenchmark {
             strategies: strategies
         )
         ConsoleReporter.print(result)
-        _ = try await FixedIterationReporter.print(title: "Insert: Layer-by-Layer", strategies: strategies)
-
-        // Print delta analysis
-        printThreeLayerDeltaAnalysis(result)
+        let fixedMeasurements = try await FixedIterationReporter.print(
+            title: "Insert: Layer-by-Layer",
+            strategies: strategies
+        )
+        printWriteLayerDeltaAnalysis(
+            result,
+            strictBaselineName: BenchmarkLayerContract.writeL1,
+            storageBaselineName: BenchmarkLayerContract.l2,
+            genericPathName: BenchmarkLayerContract.writeL3,
+            productPathName: BenchmarkLayerContract.writeL4
+        )
+        printWriteProductTargetAssessment(
+            title: "Insert Product parity summary",
+            result: result,
+            fixedMeasurements: fixedMeasurements,
+            productBaselineName: BenchmarkLayerContract.writeL1,
+            storageBaselineName: BenchmarkLayerContract.l2,
+            genericPathName: BenchmarkLayerContract.writeL3,
+            productPathName: BenchmarkLayerContract.writeL4
+        )
     }
 
     // MARK: - Phase Breakdown (CPU-only, no I/O)
@@ -248,7 +315,9 @@ enum ProfileBenchmark {
             strictBaselineName: BenchmarkLayerContract.readL1,
             storageBaselineName: BenchmarkLayerContract.l2,
             dataStoreName: BenchmarkLayerContract.readDataStoreParity,
-            contextName: BenchmarkLayerContract.fullFramework
+            contextName: BenchmarkLayerContract.fullFramework,
+            storageDescription: BenchmarkLayerContract.readL2ToL3Description,
+            contextDescription: BenchmarkLayerContract.readL3ToL4Description
         )
         printParityTargetAssessment(
             title: "Point Read Parity Summary",
@@ -463,7 +532,7 @@ enum ProfileBenchmark {
                     skipBlobCleanup: true
                 )
             }),
-            (BenchmarkLayerContract.deleteDataStoreParity, {
+            (BenchmarkLayerContract.writeL3, {
                 var item = BenchmarkItem()
                 item.id = UUID().uuidString
                 item.name = "Temp"
@@ -472,7 +541,7 @@ enum ProfileBenchmark {
                 try await reusedStore.executeBatch(inserts: [item], deletes: [])
                 try await reusedStore.executeBatch(inserts: [], deletes: [item])
             }),
-            (BenchmarkLayerContract.fullFramework, {
+            (BenchmarkLayerContract.writeL4, {
                 let id = UUID().uuidString
                 var item = BenchmarkItem()
                 item.id = id
@@ -488,103 +557,533 @@ enum ProfileBenchmark {
             strategies: strategies
         )
         ConsoleReporter.print(result)
-        let fixedMeasurements = try await FixedIterationReporter.print(title: "Insert+Delete: Layer-by-Layer", strategies: strategies)
+        let fixedMeasurements = try await measureDeletePathFixedSummaries(
+            engine: engine,
+            container: container,
+            iterations: 200,
+            rounds: 3
+        )
+        FixedIterationReporter.print(
+            title: "Insert+Delete: Layer-by-Layer",
+            summaries: fixedMeasurements,
+            iterations: 200,
+            rounds: 3
+        )
         printStorageAndContextDeltaAnalysis(
             result,
             strictBaselineName: BenchmarkLayerContract.writeL1,
             storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.deleteDataStoreParity,
-            contextName: BenchmarkLayerContract.fullFramework
+            dataStoreName: BenchmarkLayerContract.writeL3,
+            contextName: BenchmarkLayerContract.writeL4,
+            storageDescription: BenchmarkLayerContract.writeL2ToL3Description,
+            contextDescription: BenchmarkLayerContract.writeL3ToL4Description
         )
-        printParityTargetAssessment(
-            title: "Insert+Delete Parity Summary",
+        printWriteProductTargetAssessment(
+            title: "Insert+Delete Product parity summary",
             result: result,
             fixedMeasurements: fixedMeasurements,
+            productBaselineName: BenchmarkLayerContract.writeL1,
             storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.deleteDataStoreParity,
-            contextName: BenchmarkLayerContract.fullFramework
+            genericPathName: BenchmarkLayerContract.writeL3,
+            productPathName: BenchmarkLayerContract.writeL4
         )
+    }
+
+    private static func measureDeletePathFixedSummaries(
+        engine: any StorageEngine,
+        container: DBContainer,
+        iterations: Int,
+        rounds: Int
+    ) async throws -> [FixedIterationReporter.MeasurementSummary] {
+        try await RawKV.cleanup(engine: engine)
+        try await FrameworkPostgreSQL.cleanup(container: container)
+
+        let layout = try await benchmarkStorageLayout(container: container)
+
+        let rawInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
+            operation: { _ in
+                let id = UUID().uuidString
+                try await rawAdHocWrite(engine: engine, id: id)
+                try await rawAdHocDelete(engine: engine, id: id)
+            }
+        )
+        let layoutInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
+            operation: { _ in
+                let id = UUID().uuidString
+                try await frameworkLayoutStorageWrite(
+                    engine: engine,
+                    layout: layout,
+                    id: id,
+                    isNewRecord: true
+                )
+                try await frameworkLayoutStorageDelete(
+                    engine: engine,
+                    layout: layout,
+                    id: id,
+                    skipBlobCleanup: true
+                )
+            }
+        )
+        let dataStoreInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let store = try await container.store(for: BenchmarkItem.self)
+                return DataStoreRoundState(store: store)
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await state.store.executeBatch(inserts: [item], deletes: [])
+                try await state.store.executeBatch(inserts: [], deletes: [item])
+            }
+        )
+        let productInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                return DeleteContextRoundState(
+                    insertContext: FDBContext(container: container),
+                    deleteContext: FDBContext(container: container)
+                )
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                state.insertContext.insert(item)
+                try await state.insertContext.save()
+                state.deleteContext.delete(item)
+                try await state.deleteContext.save()
+            }
+        )
+
+        return [
+            .init(name: BenchmarkLayerContract.writeL1, totalNanos: rawInsertDelete / UInt64(iterations)),
+            .init(name: BenchmarkLayerContract.l2, totalNanos: layoutInsertDelete / UInt64(iterations)),
+            .init(name: BenchmarkLayerContract.writeL3, totalNanos: dataStoreInsertDelete / UInt64(iterations)),
+            .init(name: BenchmarkLayerContract.writeL4, totalNanos: productInsertDelete / UInt64(iterations)),
+        ]
     }
 
     // MARK: - Delete Fixed-Iteration Profile
 
-    static func runDeleteFixedIterationProfile(
-        engine: any StorageEngine,
+    static func runDeleteLifecycleProfile(
         container: DBContainer,
-        iterations: Int = 500
+        iterations: Int = 1000,
+        rounds: Int = 3
     ) async throws {
         print("")
         print(String(repeating: "=", count: 70))
-        print("PROFILE: Insert+Delete Hot Path Fixed Iteration (\(iterations) iterations)")
+        print("PROFILE: Delete Path Lifecycle Overhead (\(iterations) iterations, median of \(rounds) rounds)")
+        print(String(repeating: "=", count: 70))
+
+        try await FrameworkPostgreSQL.cleanup(container: container)
+
+        let reusedInsertContext = FDBContext(container: container)
+        let reusedDeleteContext = FDBContext(container: container)
+        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let clock = ContinuousClock()
+        let seedCount = max(1024, iterations + 32)
+        var insertSetupCounter = 0
+        var deleteSetupCounter = 0
+
+        let contextInit = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            _ = FDBContext(container: container)
+        }
+        let reusedInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            var item = BenchmarkItem()
+            item.id = "delete-life-insert-reused-\(insertSetupCounter)"
+            item.name = "Temp"
+            item.age = 30
+            item.score = 50.0
+            insertSetupCounter += 1
+            reusedInsertContext.insert(item)
+            reusedInsertContext.rollback()
+        }
+        let freshInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            let context = FDBContext(container: container)
+            var item = BenchmarkItem()
+            item.id = "delete-life-insert-fresh-\(insertSetupCounter)"
+            item.name = "Temp"
+            item.age = 30
+            item.score = 50.0
+            insertSetupCounter += 1
+            context.insert(item)
+            context.rollback()
+        }
+        let reusedDeleteRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            var item = BenchmarkItem()
+            item.id = "delete-life-delete-reused-\(deleteSetupCounter)"
+            item.name = "Temp"
+            item.age = 30
+            item.score = 50.0
+            deleteSetupCounter += 1
+            reusedDeleteContext.delete(item)
+            reusedDeleteContext.rollback()
+        }
+        let freshDeleteRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            let context = FDBContext(container: container)
+            var item = BenchmarkItem()
+            item.id = "delete-life-delete-fresh-\(deleteSetupCounter)"
+            item.name = "Temp"
+            item.age = 30
+            item.score = 50.0
+            deleteSetupCounter += 1
+            context.delete(item)
+            context.rollback()
+        }
+        let reusedInsertSave = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                return ContextRoundState(
+                    pool: IterationIDPool(ids: []),
+                    context: FDBContext(container: container)
+                )
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                state.context.insert(item)
+                try await state.context.save()
+            }
+        )
+        let reusedStoreInsert = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                return DataStoreRoundState(store: reusedStore)
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await state.store.executeBatch(inserts: [item], deletes: [])
+            }
+        )
+        let lookupStoreInsert = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                return PoolRoundState(pool: IterationIDPool(ids: []))
+            },
+            operation: { _ in
+                let store = try await container.store(for: BenchmarkItem.self)
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await store.executeBatch(inserts: [item], deletes: [])
+            }
+        )
+        let freshInsertSave = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                return PoolRoundState(pool: IterationIDPool(ids: []))
+            },
+            operation: { _ in
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+            }
+        )
+        let reusedDeleteSave = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "delete-life-reused-r\(round)"
+                )
+                return ContextRoundState(
+                    pool: IterationIDPool(ids: ids),
+                    context: FDBContext(container: container)
+                )
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                state.context.delete(item)
+                try await state.context.save()
+            }
+        )
+        let reusedStoreDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "delete-life-store-reused-r\(round)"
+                )
+                return DataStorePoolRoundState(
+                    store: reusedStore,
+                    pool: IterationIDPool(ids: ids)
+                )
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await state.store.executeBatch(inserts: [], deletes: [item])
+            }
+        )
+        let lookupStoreDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "delete-life-store-lookup-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                let store = try await container.store(for: BenchmarkItem.self)
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await store.executeBatch(inserts: [], deletes: [item])
+            }
+        )
+        let freshDeleteSave = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "delete-life-fresh-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                try await FrameworkPostgreSQL.deleteOne(container: container, id: state.pool.next())
+            }
+        )
+
+        let results = [
+            PhaseResult(name: "FDBContext.init()", iterations: iterations, totalNanos: contextInit),
+            PhaseResult(name: "FDBContext.insert()+rollback() reused", iterations: iterations, totalNanos: reusedInsertRollback),
+            PhaseResult(name: "FDBContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanos: freshInsertRollback),
+            PhaseResult(name: "FDBContext.delete()+rollback() reused", iterations: iterations, totalNanos: reusedDeleteRollback),
+            PhaseResult(name: "FDBContext.init()+delete()+rollback() fresh", iterations: iterations, totalNanos: freshDeleteRollback),
+            PhaseResult(name: "DataStore.executeBatch() insert reused store", iterations: iterations, totalNanos: reusedStoreInsert),
+            PhaseResult(name: "DataStore.executeBatch() insert with store lookup", iterations: iterations, totalNanos: lookupStoreInsert),
+            PhaseResult(name: "FDBContext.save() insert reused", iterations: iterations, totalNanos: reusedInsertSave),
+            PhaseResult(name: "FDBContext.save() insert fresh", iterations: iterations, totalNanos: freshInsertSave),
+            PhaseResult(name: "DataStore.executeBatch() delete reused store", iterations: iterations, totalNanos: reusedStoreDelete),
+            PhaseResult(name: "DataStore.executeBatch() delete with store lookup", iterations: iterations, totalNanos: lookupStoreDelete),
+            PhaseResult(name: "FDBContext.save() delete reused", iterations: iterations, totalNanos: reusedDeleteSave),
+            PhaseResult(name: "FDBContext.save() delete fresh", iterations: iterations, totalNanos: freshDeleteSave),
+        ]
+
+        print("")
+        print("  Phase                                      Avg (us)")
+        print("  " + String(repeating: "-", count: 52))
+        for r in results {
+            print(r)
+        }
+        print("")
+
+        print("  Inferred overheads")
+        print("  " + String(repeating: "-", count: 52))
+        printSignedDelta(
+            name: "fresh insert setup - reused",
+            deltaNanos: Int64(freshInsertRollback) - Int64(reusedInsertRollback),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "fresh delete setup - reused",
+            deltaNanos: Int64(freshDeleteRollback) - Int64(reusedDeleteRollback),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "fresh insert save - reused",
+            deltaNanos: Int64(freshInsertSave) - Int64(reusedInsertSave),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "fresh delete save - reused",
+            deltaNanos: Int64(freshDeleteSave) - Int64(reusedDeleteSave),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "store lookup insert - reused store",
+            deltaNanos: Int64(lookupStoreInsert) - Int64(reusedStoreInsert),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "store lookup delete - reused store",
+            deltaNanos: Int64(lookupStoreDelete) - Int64(reusedStoreDelete),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "fresh insert save - store lookup insert",
+            deltaNanos: Int64(freshInsertSave) - Int64(lookupStoreInsert),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "fresh delete save - store lookup delete",
+            deltaNanos: Int64(freshDeleteSave) - Int64(lookupStoreDelete),
+            iterations: iterations
+        )
+        print("")
+    }
+
+    static func runDeleteFixedIterationProfile(
+        engine: any StorageEngine,
+        container: DBContainer,
+        iterations: Int = 500,
+        rounds: Int = 3
+    ) async throws {
+        print("")
+        print(String(repeating: "=", count: 70))
+        print("PROFILE: Insert+Delete Hot Path Fixed Iteration (\(iterations) iterations, median of \(rounds) rounds)")
         print(String(repeating: "=", count: 70))
 
         try await RawKV.cleanup(engine: engine)
         try await FrameworkPostgreSQL.cleanup(container: container)
 
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
-        let reusedInsertContext = FDBContext(container: container)
-        let reusedDeleteContext = FDBContext(container: container)
+        let rawInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
+            operation: { _ in
+                let id = UUID().uuidString
+                try await rawAdHocWrite(engine: engine, id: id)
+                try await rawAdHocDelete(engine: engine, id: id)
+            }
+        )
 
-        let rawInsertDelete = try await measureAsyncPhase(iterations: iterations) {
-            let id = UUID().uuidString
-            try await rawAdHocWrite(engine: engine, id: id)
-            try await rawAdHocDelete(engine: engine, id: id)
-        }
+        let layoutInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
+            operation: { _ in
+                let id = UUID().uuidString
+                try await frameworkLayoutStorageWrite(
+                    engine: engine,
+                    layout: layout,
+                    id: id,
+                    isNewRecord: true
+                )
+                try await frameworkLayoutStorageDelete(
+                    engine: engine,
+                    layout: layout,
+                    id: id,
+                    skipBlobCleanup: true
+                )
+            }
+        )
 
-        let layoutInsertDelete = try await measureAsyncPhase(iterations: iterations) {
-            let id = UUID().uuidString
-            try await frameworkLayoutStorageWrite(
-                engine: engine,
-                layout: layout,
-                id: id,
-                isNewRecord: true
-            )
-            try await frameworkLayoutStorageDelete(
-                engine: engine,
-                layout: layout,
-                id: id,
-                skipBlobCleanup: true
-            )
-        }
+        let dataStoreInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let store = try await container.store(for: BenchmarkItem.self)
+                return DataStoreRoundState(store: store)
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await state.store.executeBatch(inserts: [item], deletes: [])
+                try await state.store.executeBatch(inserts: [], deletes: [item])
+            }
+        )
 
-        let dataStoreInsertDelete = try await measureAsyncPhase(iterations: iterations) {
-            var item = BenchmarkItem()
-            item.id = UUID().uuidString
-            item.name = "Temp"
-            item.age = 30
-            item.score = 50.0
-            try await reusedStore.executeBatch(inserts: [item], deletes: [])
-            try await reusedStore.executeBatch(inserts: [], deletes: [item])
-        }
+        let reusedContextInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                return DeleteContextRoundState(
+                    insertContext: FDBContext(container: container),
+                    deleteContext: FDBContext(container: container)
+                )
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = UUID().uuidString
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                state.insertContext.insert(item)
+                try await state.insertContext.save()
+                state.deleteContext.delete(item)
+                try await state.deleteContext.save()
+            }
+        )
 
-        let reusedContextInsertDelete = try await measureAsyncPhase(iterations: iterations) {
-            var item = BenchmarkItem()
-            item.id = UUID().uuidString
-            item.name = "Temp"
-            item.age = 30
-            item.score = 50.0
-            reusedInsertContext.insert(item)
-            try await reusedInsertContext.save()
-            reusedDeleteContext.delete(item)
-            try await reusedDeleteContext.save()
-        }
-
-        let freshContextInsertDelete = try await measureAsyncPhase(iterations: iterations) {
-            let id = UUID().uuidString
-            var item = BenchmarkItem()
-            item.id = id
-            item.name = "Temp"
-            item.age = 30
-            item.score = 50.0
-            try await FrameworkPostgreSQL.insertOne(container: container, item: item)
-            try await FrameworkPostgreSQL.deleteOne(container: container, id: id)
-        }
+        let freshContextInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { _ in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                return PoolRoundState(pool: IterationIDPool(ids: []))
+            },
+            operation: { _ in
+                let id = UUID().uuidString
+                var item = BenchmarkItem()
+                item.id = id
+                item.name = "Temp"
+                item.age = 30
+                item.score = 50.0
+                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+                try await FrameworkPostgreSQL.deleteOne(container: container, id: id)
+            }
+        )
 
         let results = [
             PhaseResult(name: "Raw KV insert+delete", iterations: iterations, totalNanos: rawInsertDelete),
             PhaseResult(name: "Framework layout + storage insert+delete", iterations: iterations, totalNanos: layoutInsertDelete),
-            PhaseResult(name: "DataStore.executeBatch() insert+delete", iterations: iterations, totalNanos: dataStoreInsertDelete),
+            PhaseResult(name: "Generic DataStore batch path insert+delete", iterations: iterations, totalNanos: dataStoreInsertDelete),
             PhaseResult(name: "FDBContext.save() reused contexts", iterations: iterations, totalNanos: reusedContextInsertDelete),
             PhaseResult(name: "FDBContext.save() fresh contexts", iterations: iterations, totalNanos: freshContextInsertDelete),
         ]
@@ -600,17 +1099,17 @@ enum ProfileBenchmark {
         print("  Inferred overheads")
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
-            name: "DataStore.executeBatch() - layout storage insert+delete",
+            name: "generic-vs-layout insert+delete",
             deltaNanos: Int64(dataStoreInsertDelete) - Int64(layoutInsertDelete),
             iterations: iterations
         )
         printSignedDelta(
-            name: "FDBContext.save() reused - DataStore.executeBatch()",
+            name: "product-vs-generic insert+delete",
             deltaNanos: Int64(reusedContextInsertDelete) - Int64(dataStoreInsertDelete),
             iterations: iterations
         )
         printSignedDelta(
-            name: "fresh contexts - reused contexts",
+            name: "fresh-vs-reused insert+delete",
             deltaNanos: Int64(freshContextInsertDelete) - Int64(reusedContextInsertDelete),
             iterations: iterations
         )
@@ -670,10 +1169,10 @@ enum ProfileBenchmark {
                     isNewRecord: false
                 )
             }),
-            (BenchmarkLayerContract.updateDataStoreParity, {
+            (BenchmarkLayerContract.writeL3, {
                 try await reusedStore.executeBatch(inserts: [updatedItem], deletes: [])
             }),
-            (BenchmarkLayerContract.fullFramework, {
+            (BenchmarkLayerContract.writeL4, {
                 try await FrameworkPostgreSQL.updateOne(container: container, item: updatedItem)
             }),
         ]
@@ -682,92 +1181,237 @@ enum ProfileBenchmark {
             strategies: strategies
         )
         ConsoleReporter.print(result)
-        let fixedMeasurements = try await FixedIterationReporter.print(title: "Update: Layer-by-Layer", strategies: strategies)
+        let fixedMeasurements = try await measureUpdatePathFixedSummaries(
+            engine: engine,
+            container: container,
+            iterations: 200,
+            rounds: 3
+        )
+        FixedIterationReporter.print(
+            title: "Update: Layer-by-Layer",
+            summaries: fixedMeasurements,
+            iterations: 200,
+            rounds: 3
+        )
         printStorageAndContextDeltaAnalysis(
             result,
             strictBaselineName: BenchmarkLayerContract.writeL1,
             storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.updateDataStoreParity,
-            contextName: BenchmarkLayerContract.fullFramework
+            dataStoreName: BenchmarkLayerContract.writeL3,
+            contextName: BenchmarkLayerContract.writeL4,
+            storageDescription: BenchmarkLayerContract.writeL2ToL3Description,
+            contextDescription: BenchmarkLayerContract.writeL3ToL4Description
         )
-        printParityTargetAssessment(
-            title: "Point Update Parity Summary",
+        printWriteProductTargetAssessment(
+            title: "Point Update Product parity summary",
             result: result,
             fixedMeasurements: fixedMeasurements,
+            productBaselineName: BenchmarkLayerContract.writeL1,
             storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.updateDataStoreParity,
-            contextName: BenchmarkLayerContract.fullFramework
+            genericPathName: BenchmarkLayerContract.writeL3,
+            productPathName: BenchmarkLayerContract.writeL4
         )
     }
 
-    // MARK: - Update Fixed-Iteration Profile
-
-    static func runUpdateFixedIterationProfile(
+    private static func measureUpdatePathFixedSummaries(
         engine: any StorageEngine,
         container: DBContainer,
-        iterations: Int = 500
-    ) async throws {
-        print("")
-        print(String(repeating: "=", count: 70))
-        print("PROFILE: Update Hot Path Fixed Iteration (\(iterations) iterations)")
-        print(String(repeating: "=", count: 70))
-
+        iterations: Int,
+        rounds: Int
+    ) async throws -> [FixedIterationReporter.MeasurementSummary] {
         try await RawKV.cleanup(engine: engine)
         try await FrameworkPostgreSQL.cleanup(container: container)
 
-        let rawID = "update-fixed-raw"
-        let fwID = "update-fixed-fw"
         let layout = try await benchmarkStorageLayout(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
-        let reusedContext = FDBContext(container: container)
+        let seedCount = 1024
 
-        try await frameworkLayoutStorageWrite(
-            engine: engine,
-            layout: layout,
-            id: rawID,
-            isNewRecord: true
+        let rawUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await RawKV.cleanup(engine: engine)
+                let ids = try await RawKV.seedData(
+                    engine: engine,
+                    count: seedCount,
+                    idPrefix: "update-profile-raw-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                try await RawKV.updateOne(engine: engine, id: state.pool.next())
+            }
+        )
+        let layoutUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await seedFrameworkLayoutStorageData(
+                    engine: engine,
+                    layout: layout,
+                    count: seedCount,
+                    idPrefix: "update-profile-layout-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                try await frameworkLayoutStorageWrite(
+                    engine: engine,
+                    layout: layout,
+                    id: state.pool.next(),
+                    isNewRecord: false
+                )
+            }
+        )
+        let dataStoreUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "update-profile-ds-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Updated Stable"
+                item.age = 42
+                item.score = 91.25
+                try await reusedStore.executeBatch(inserts: [item], deletes: [])
+            }
+        )
+        let productUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "update-profile-fw-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Updated Stable"
+                item.age = 42
+                item.score = 91.25
+                try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+            }
         )
 
-        var initialItem = BenchmarkItem()
-        initialItem.id = fwID
-        initialItem.name = "Original Stable"
-        initialItem.age = 25
-        initialItem.score = 70.0
-        try await FrameworkPostgreSQL.insertOne(container: container, item: initialItem)
+        let divisor = UInt64(iterations)
+        return [
+            .init(name: BenchmarkLayerContract.writeL1, totalNanos: rawUpdate / divisor),
+            .init(name: BenchmarkLayerContract.l2, totalNanos: layoutUpdate / divisor),
+            .init(name: BenchmarkLayerContract.writeL3, totalNanos: dataStoreUpdate / divisor),
+            .init(name: BenchmarkLayerContract.writeL4, totalNanos: productUpdate / divisor),
+        ]
+    }
 
-        var updated = BenchmarkItem()
-        updated.id = fwID
-        updated.name = "Updated Stable"
-        updated.age = 42
-        updated.score = 91.25
-        let updatedItem = updated
+    // MARK: - Update Lifecycle Profile
 
-        let rawUpdate = try await measureAsyncPhase(iterations: iterations) {
-            try await rawAdHocWrite(engine: engine, id: rawID)
+    static func runUpdateLifecycleProfile(
+        engine _: any StorageEngine,
+        container: DBContainer,
+        iterations: Int = 1000,
+        rounds: Int = 3
+    ) async throws {
+        print("")
+        print(String(repeating: "=", count: 70))
+        print("PROFILE: Update Path Lifecycle Overhead (\(iterations) iterations, median of \(rounds) rounds)")
+        print(String(repeating: "=", count: 70))
+
+        try await FrameworkPostgreSQL.cleanup(container: container)
+
+        let reusedContext = FDBContext(container: container)
+        let clock = ContinuousClock()
+        let seedCount = 1024
+        var reusedSetupCounter = 0
+        var freshSetupCounter = 0
+
+        let contextInit = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            _ = FDBContext(container: container)
         }
-        let layoutUpdate = try await measureAsyncPhase(iterations: iterations) {
-            try await frameworkLayoutStorageWrite(
-                engine: engine,
-                layout: layout,
-                id: rawID,
-                isNewRecord: false
-            )
+        let reusedInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            var item = BenchmarkItem()
+            item.id = "update-life-local-reused-\(reusedSetupCounter)"
+            item.name = "Updated Stable"
+            item.age = 42
+            item.score = 91.25
+            reusedSetupCounter += 1
+            reusedContext.insert(item)
+            reusedContext.rollback()
         }
-        let dataStoreUpdate = try await measureAsyncPhase(iterations: iterations) {
-            try await reusedStore.executeBatch(inserts: [updatedItem], deletes: [])
+        let freshInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
+            let context = FDBContext(container: container)
+            var item = BenchmarkItem()
+            item.id = "update-life-local-fresh-\(freshSetupCounter)"
+            item.name = "Updated Stable"
+            item.age = 42
+            item.score = 91.25
+            freshSetupCounter += 1
+            context.insert(item)
+            context.rollback()
         }
-        let reusedContextUpdate = try await measureAsyncPhase(iterations: iterations) {
-            reusedContext.insert(updatedItem)
-            try await reusedContext.save()
-        }
-        let freshContextUpdate = try await measureAsyncPhase(iterations: iterations) {
-            try await FrameworkPostgreSQL.updateOne(container: container, item: updatedItem)
-        }
+        let reusedContextUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "update-life-reused-r\(round)"
+                )
+                return ContextRoundState(
+                    pool: IterationIDPool(ids: ids),
+                    context: FDBContext(container: container)
+                )
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Updated Stable"
+                item.age = 42
+                item.score = 91.25
+                state.context.insert(item)
+                try await state.context.save()
+            }
+        )
+        let freshContextUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "update-life-fresh-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Updated Stable"
+                item.age = 42
+                item.score = 91.25
+                try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+            }
+        )
 
         let results = [
-            PhaseResult(name: "Raw KV update", iterations: iterations, totalNanos: rawUpdate),
-            PhaseResult(name: "Framework layout + storage update", iterations: iterations, totalNanos: layoutUpdate),
-            PhaseResult(name: "DataStore.executeBatch()", iterations: iterations, totalNanos: dataStoreUpdate),
+            PhaseResult(name: "FDBContext.init()", iterations: iterations, totalNanos: contextInit),
+            PhaseResult(name: "FDBContext.insert()+rollback() reused", iterations: iterations, totalNanos: reusedInsertRollback),
+            PhaseResult(name: "FDBContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanos: freshInsertRollback),
             PhaseResult(name: "FDBContext.save() reused context", iterations: iterations, totalNanos: reusedContextUpdate),
             PhaseResult(name: "FDBContext.save() fresh context", iterations: iterations, totalNanos: freshContextUpdate),
         ]
@@ -783,17 +1427,174 @@ enum ProfileBenchmark {
         print("  Inferred overheads")
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
-            name: "DataStore.executeBatch() - layout storage update",
+            name: "fresh setup - reused setup",
+            deltaNanos: Int64(freshInsertRollback) - Int64(reusedInsertRollback),
+            iterations: iterations
+        )
+        printSignedDelta(
+            name: "fresh save - reused save",
+            deltaNanos: Int64(freshContextUpdate) - Int64(reusedContextUpdate),
+            iterations: iterations
+        )
+        print("")
+    }
+
+    // MARK: - Update Fixed-Iteration Profile
+
+    static func runUpdateFixedIterationProfile(
+        engine: any StorageEngine,
+        container: DBContainer,
+        iterations: Int = 500,
+        rounds: Int = 3
+    ) async throws {
+        print("")
+        print(String(repeating: "=", count: 70))
+        print("PROFILE: Update Hot Path Fixed Iteration (\(iterations) iterations, median of \(rounds) rounds)")
+        print(String(repeating: "=", count: 70))
+
+        try await RawKV.cleanup(engine: engine)
+        try await FrameworkPostgreSQL.cleanup(container: container)
+
+        let layout = try await benchmarkStorageLayout(container: container)
+        let seedCount = 1024
+        let reusedStore = try await container.store(for: BenchmarkItem.self)
+
+        let rawUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await RawKV.cleanup(engine: engine)
+                let ids = try await RawKV.seedData(
+                    engine: engine,
+                    count: seedCount,
+                    idPrefix: "update-fixed-raw-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                try await RawKV.updateOne(engine: engine, id: state.pool.next())
+            }
+        )
+        let layoutUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await seedFrameworkLayoutStorageData(
+                    engine: engine,
+                    layout: layout,
+                    count: seedCount,
+                    idPrefix: "update-fixed-layout-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                try await frameworkLayoutStorageWrite(
+                    engine: engine,
+                    layout: layout,
+                    id: state.pool.next(),
+                    isNewRecord: false
+                )
+            }
+        )
+        let dataStoreUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "update-fixed-ds-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Updated Stable"
+                item.age = 42
+                item.score = 91.25
+                try await reusedStore.executeBatch(inserts: [item], deletes: [])
+            }
+        )
+        let reusedContextUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "update-fixed-reused-r\(round)"
+                )
+                return ContextRoundState(
+                    pool: IterationIDPool(ids: ids),
+                    context: FDBContext(container: container)
+                )
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Updated Stable"
+                item.age = 42
+                item.score = 91.25
+                state.context.insert(item)
+                try await state.context.save()
+            }
+        )
+        let freshContextUpdate = try await measureAsyncPhaseMedianWithSetup(
+            iterations: iterations,
+            rounds: rounds,
+            setup: { round in
+                try await FrameworkPostgreSQL.cleanup(container: container)
+                let ids = try await FrameworkPostgreSQL.seedData(
+                    container: container,
+                    count: seedCount,
+                    idPrefix: "update-fixed-fresh-r\(round)"
+                )
+                return PoolRoundState(pool: IterationIDPool(ids: ids))
+            },
+            operation: { state in
+                var item = BenchmarkItem()
+                item.id = state.pool.next()
+                item.name = "Updated Stable"
+                item.age = 42
+                item.score = 91.25
+                try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+            }
+        )
+
+        let results = [
+            PhaseResult(name: "Raw KV update", iterations: iterations, totalNanos: rawUpdate),
+            PhaseResult(name: "Framework layout + storage update", iterations: iterations, totalNanos: layoutUpdate),
+            PhaseResult(name: "Generic DataStore batch path", iterations: iterations, totalNanos: dataStoreUpdate),
+            PhaseResult(name: "FDBContext.save() reused context", iterations: iterations, totalNanos: reusedContextUpdate),
+            PhaseResult(name: "FDBContext.save() fresh context", iterations: iterations, totalNanos: freshContextUpdate),
+        ]
+
+        print("")
+        print("  Phase                                      Avg (us)")
+        print("  " + String(repeating: "-", count: 52))
+        for r in results {
+            print(r)
+        }
+        print("")
+
+        print("  Inferred overheads")
+        print("  " + String(repeating: "-", count: 52))
+        printSignedDelta(
+            name: "generic-vs-layout storage update",
             deltaNanos: Int64(dataStoreUpdate) - Int64(layoutUpdate),
             iterations: iterations
         )
         printSignedDelta(
-            name: "FDBContext.save() reused - DataStore.executeBatch()",
+            name: "product-vs-generic update",
             deltaNanos: Int64(reusedContextUpdate) - Int64(dataStoreUpdate),
             iterations: iterations
         )
         printSignedDelta(
-            name: "fresh context - reused context",
+            name: "fresh-vs-reused update",
             deltaNanos: Int64(freshContextUpdate) - Int64(reusedContextUpdate),
             iterations: iterations
         )
@@ -973,6 +1774,20 @@ enum ProfileBenchmark {
         return UInt64(nanos)
     }
 
+    private static func measurePhaseMedian(
+        iterations: Int,
+        rounds: Int,
+        clock: ContinuousClock,
+        operation: () throws -> Void
+    ) throws -> UInt64 {
+        var samples: [UInt64] = []
+        samples.reserveCapacity(max(1, rounds))
+        for _ in 0..<max(1, rounds) {
+            samples.append(try measurePhase(iterations: iterations, clock: clock, operation: operation))
+        }
+        return median(samples)
+    }
+
     private static func measureAsyncPhase(
         iterations: Int,
         operation: @Sendable () async throws -> Void
@@ -987,6 +1802,49 @@ enum ProfileBenchmark {
         }
         let end = DispatchTime.now().uptimeNanoseconds
         return end - start
+    }
+
+    private static func measureAsyncPhaseMedian(
+        iterations: Int,
+        rounds: Int,
+        operation: @Sendable () async throws -> Void
+    ) async throws -> UInt64 {
+        var samples: [UInt64] = []
+        samples.reserveCapacity(max(1, rounds))
+        for _ in 0..<max(1, rounds) {
+            samples.append(try await measureAsyncPhase(iterations: iterations, operation: operation))
+        }
+        return median(samples)
+    }
+
+    private static func measureAsyncPhaseMedianWithSetup<State: Sendable>(
+        iterations: Int,
+        rounds: Int,
+        setup: @Sendable (Int) async throws -> State,
+        operation: @Sendable (State) async throws -> Void
+    ) async throws -> UInt64 {
+        var samples: [UInt64] = []
+        samples.reserveCapacity(max(1, rounds))
+        for round in 0..<max(1, rounds) {
+            let state = try await setup(round)
+            samples.append(try await measureAsyncPhase(iterations: iterations) {
+                try await operation(state)
+            })
+        }
+        return median(samples)
+    }
+
+    private static func median(_ values: [UInt64]) -> UInt64 {
+        guard !values.isEmpty else {
+            return 0
+        }
+
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
     }
 
     private static func printGenericDeltaAnalysis(_ result: StrategyComparisonResult) {
@@ -1041,7 +1899,7 @@ enum ProfileBenchmark {
         )
         printLayerDelta(
             label: "L2 → L3",
-            description: BenchmarkLayerContract.l2ToL3Description,
+            description: BenchmarkLayerContract.readL2ToL3Description,
             from: l2,
             to: l3
         )
@@ -1059,7 +1917,9 @@ enum ProfileBenchmark {
         strictBaselineName: String? = nil,
         storageBaselineName: String,
         dataStoreName: String,
-        contextName: String
+        contextName: String,
+        storageDescription: String = BenchmarkLayerContract.readL2ToL3Description,
+        contextDescription: String = BenchmarkLayerContract.readL3ToL4Description
     ) {
         guard
             let storageBaseline = result.strategies.first(where: { $0.name == storageBaselineName }),
@@ -1087,7 +1947,7 @@ enum ProfileBenchmark {
         print("  " + String(repeating: "-", count: 52))
         printLayerDelta(
             label: "\(storageBaselineName) → \(dataStoreName)",
-            description: "storage parity",
+            description: storageDescription,
             from: storageBaseline,
             to: dataStore
         )
@@ -1097,10 +1957,52 @@ enum ProfileBenchmark {
         print("  " + String(repeating: "-", count: 52))
         printLayerDelta(
             label: "\(dataStoreName) → \(contextName)",
-            description: "context parity",
+            description: contextDescription,
             from: dataStore,
             to: context
         )
+        print("")
+    }
+
+    private static func printWriteLayerDeltaAnalysis(
+        _ result: StrategyComparisonResult,
+        strictBaselineName: String,
+        storageBaselineName: String,
+        genericPathName: String,
+        productPathName: String
+    ) {
+        guard
+            let strictBaseline = result.strategies.first(where: { $0.name == strictBaselineName }),
+            let storageBaseline = result.strategies.first(where: { $0.name == storageBaselineName }),
+            let genericPath = result.strategies.first(where: { $0.name == genericPathName }),
+            let productPath = result.strategies.first(where: { $0.name == productPathName })
+        else {
+            printGenericDeltaAnalysis(result)
+            return
+        }
+
+        print("  Delta Analysis")
+        print("  " + String(repeating: "-", count: 52))
+        printLayerDelta(
+            label: "\(strictBaselineName) → \(storageBaselineName)",
+            description: BenchmarkLayerContract.l1ToL2Description,
+            from: strictBaseline,
+            to: storageBaseline
+        )
+        printLayerDelta(
+            label: "\(storageBaselineName) → \(genericPathName)",
+            description: BenchmarkLayerContract.writeL2ToL3Description,
+            from: storageBaseline,
+            to: genericPath
+        )
+        printLayerDelta(
+            label: "\(genericPathName) → \(productPathName)",
+            description: BenchmarkLayerContract.writeL3ToL4Description,
+            from: genericPath,
+            to: productPath
+        )
+        print("")
+        print("  \(strictBaselineName) → \(productPathName) product-level strict gap: \(String(format: "%+.2f", productPath.metrics.latency.p50 - strictBaseline.metrics.latency.p50))ms")
         print("")
     }
 
@@ -1137,6 +2039,77 @@ enum ProfileBenchmark {
             targetFixedDeltaMicros: targetFixedDeltaMicros,
             tolerance: tolerance
         )
+    }
+
+    private static func printWriteProductTargetAssessment(
+        title: String,
+        result: StrategyComparisonResult,
+        fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
+        productBaselineName: String,
+        storageBaselineName: String,
+        genericPathName: String,
+        productPathName: String,
+        targetThroughputOverheadPct: Double = 10.0,
+        targetFixedDeltaMicros: Double = 20.0,
+        tolerance: Double = 0.05
+    ) {
+        print("  \(title)")
+        print("  " + String(repeating: "-", count: 52))
+        printTargetAssessmentSection(
+            heading: BenchmarkLayerContract.productParitySummary,
+            result: result,
+            fixedMeasurements: fixedMeasurements,
+            baselineName: productBaselineName,
+            candidateName: productPathName,
+            targetThroughputOverheadPct: targetThroughputOverheadPct,
+            targetFixedDeltaMicros: targetFixedDeltaMicros,
+            tolerance: tolerance
+        )
+        printWriteDiagnosticAssessmentSection(
+            heading: BenchmarkLayerContract.diagnosticBreakdown,
+            result: result,
+            fixedMeasurements: fixedMeasurements,
+            baselineName: storageBaselineName,
+            candidateName: genericPathName
+        )
+        printWriteDiagnosticAssessmentSection(
+            heading: "Product fast-path diagnostic",
+            result: result,
+            fixedMeasurements: fixedMeasurements,
+            baselineName: genericPathName,
+            candidateName: productPathName,
+            expectedFastPathWin: true
+        )
+    }
+
+    private static func printWriteDiagnosticAssessmentSection(
+        heading: String,
+        result: StrategyComparisonResult,
+        fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
+        baselineName: String,
+        candidateName: String,
+        expectedFastPathWin: Bool = false
+    ) {
+        guard
+            let baseline = result.strategies.first(where: { $0.name == baselineName }),
+            let candidate = result.strategies.first(where: { $0.name == candidateName }),
+            let fixedBaseline = fixedMeasurements.first(where: { $0.name == baselineName }),
+            let fixedCandidate = fixedMeasurements.first(where: { $0.name == candidateName }),
+            let baselineThroughput = baseline.metrics.throughput?.opsPerSecond,
+            let candidateThroughput = candidate.metrics.throughput?.opsPerSecond,
+            baselineThroughput > 0
+        else {
+            return
+        }
+
+        let throughputDelta = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
+        let fixedDelta = fixedCandidate.averageMicros - fixedBaseline.averageMicros
+
+        print("  \(heading)")
+        print("  " + String(repeating: "-", count: 52))
+        print("  \(baselineName) -> \(candidateName) throughput delta: \(formatWriteDiagnosticLine(delta: throughputDelta, unit: "%", expectedFastPathWin: expectedFastPathWin))")
+        print("  \(baselineName) -> \(candidateName) fixed delta: \(formatWriteDiagnosticLine(delta: fixedDelta, unit: " us/op", expectedFastPathWin: expectedFastPathWin))")
+        print("")
     }
 
     private static func printTargetAssessmentSection(
@@ -1183,6 +2156,18 @@ enum ProfileBenchmark {
             return "faster by \(String(format: "%.2f", abs(delta)))\(unit) [PASS]"
         }
         return "actual \(String(format: "%.2f", delta))\(unit) [\(delta <= tolerance ? "PASS" : "MISS")]"
+    }
+
+    private static func formatWriteDiagnosticLine(
+        delta: Double,
+        unit: String,
+        expectedFastPathWin: Bool
+    ) -> String {
+        if delta < 0 {
+            let suffix = expectedFastPathWin ? " (expected product fast-path win)" : ""
+            return "faster by \(String(format: "%.2f", abs(delta)))\(unit)\(suffix)"
+        }
+        return "slower by \(String(format: "%.2f", delta))\(unit)"
     }
 
     private static func printLayerDelta(
