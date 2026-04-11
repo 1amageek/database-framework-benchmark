@@ -7,7 +7,7 @@ let package = Package(
     dependencies: [
         // Use the adjacent local checkout so benchmark runs against in-flight framework changes.
         .package(path: "../database-framework", traits: ["PostgreSQL"]),
-        .package(url: "https://github.com/1amageek/database-kit.git", from: "26.0324.0"),
+        .package(url: "https://github.com/1amageek/database-kit.git", from: "26.0411.0"),
         .package(url: "https://github.com/1amageek/storage-kit.git", from: "26.0324.0", traits: ["PostgreSQL"]),
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.25.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.7.0"),
