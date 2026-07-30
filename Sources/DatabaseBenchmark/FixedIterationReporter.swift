@@ -3,10 +3,10 @@ import Foundation
 enum FixedIterationReporter {
     struct MeasurementSummary {
         let name: String
-        let totalNanos: UInt64
+        let totalNanoseconds: UInt64
 
-        var averageMicros: Double {
-            Double(totalNanos) / 1000.0
+        var averageMicroseconds: Double {
+            Double(totalNanoseconds) / 1000.0
         }
     }
 
@@ -37,15 +37,15 @@ enum FixedIterationReporter {
         let nameWidth = max(28, measurements.map(\.name.count).max() ?? 0)
         for measurement in measurements {
             let padded = measurement.name.padding(toLength: nameWidth, withPad: " ", startingAt: 0)
-            Swift.print("  \(padded) \(String(format: "%8.1f", measurement.averageMicros)) us/op")
+            Swift.print("  \(padded) \(String(format: "%8.1f", measurement.averageMicroseconds)) us/op")
         }
         Swift.print("")
 
         if let baseline = measurements.first {
             for measurement in measurements.dropFirst() {
-                let deltaMicros = measurement.averageMicros - baseline.averageMicros
+                let deltaMicroseconds = measurement.averageMicroseconds - baseline.averageMicroseconds
                 Swift.print(
-                    "  Delta vs \(baseline.name): \(measurement.name) \(String(format: "%+.1f", deltaMicros)) us/op"
+                    "  Delta vs \(baseline.name): \(measurement.name) \(String(format: "%+.1f", deltaMicroseconds)) us/op"
                 )
             }
             Swift.print("")
@@ -69,15 +69,15 @@ enum FixedIterationReporter {
         let nameWidth = max(28, summaries.map(\.name.count).max() ?? 0)
         for measurement in summaries {
             let padded = measurement.name.padding(toLength: nameWidth, withPad: " ", startingAt: 0)
-            Swift.print("  \(padded) \(String(format: "%8.1f", measurement.averageMicros)) us/op")
+            Swift.print("  \(padded) \(String(format: "%8.1f", measurement.averageMicroseconds)) us/op")
         }
         Swift.print("")
 
         if let baseline = summaries.first {
             for measurement in summaries.dropFirst() {
-                let deltaMicros = measurement.averageMicros - baseline.averageMicros
+                let deltaMicroseconds = measurement.averageMicroseconds - baseline.averageMicroseconds
                 Swift.print(
-                    "  Delta vs \(baseline.name): \(measurement.name) \(String(format: "%+.1f", deltaMicros)) us/op"
+                    "  Delta vs \(baseline.name): \(measurement.name) \(String(format: "%+.1f", deltaMicroseconds)) us/op"
                 )
             }
             Swift.print("")
@@ -111,7 +111,7 @@ enum FixedIterationReporter {
 
         return MeasurementSummary(
             name: name,
-            totalNanos: median
+            totalNanoseconds: median
         )
     }
 }

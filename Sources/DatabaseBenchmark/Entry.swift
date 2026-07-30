@@ -5,7 +5,7 @@ import BenchmarkFramework
 import PostgreSQLStorage
 import StorageKit
 import DatabaseEngine
-import Core
+import DatabaseKit
 
 typealias Strategy = (String, @Sendable () async throws -> Void)
 
@@ -187,7 +187,7 @@ private func withBenchmarkEnvironment<T>(
                 throw BenchmarkRuntimeError.postgresUnavailable(host: config.host, port: config.port)
             }
 
-            let container = try await FrameworkPostgreSQL.makeContainer(config: config)
+            let container = try await DatabaseRecordWorkload.makeContainer(config: config)
             let engine = container.engine
             let runner = BenchmarkRunner(config: .init(
                 warmupIterations: 10,
@@ -199,8 +199,8 @@ private func withBenchmarkEnvironment<T>(
                 try await warmupBenchmarkEnvironment(engine: engine, container: container)
                 let result = try await body(runner, engine, container)
                 do {
-                    try await RawKV.cleanup(engine: engine)
-                    try await FrameworkPostgreSQL.cleanup(container: container)
+                    try await DirectStorageWorkload.cleanup(engine: engine)
+                    try await DatabaseRecordWorkload.cleanup(container: container)
                 } catch {
                     print("Cleanup warning: \(error)")
                 }
@@ -208,8 +208,8 @@ private func withBenchmarkEnvironment<T>(
                 return result
             } catch {
                 do {
-                    try await RawKV.cleanup(engine: engine)
-                    try await FrameworkPostgreSQL.cleanup(container: container)
+                    try await DirectStorageWorkload.cleanup(engine: engine)
+                    try await DatabaseRecordWorkload.cleanup(container: container)
                 } catch {
                     print("Cleanup warning after failure: \(error)")
                 }
@@ -237,15 +237,15 @@ private func warmupBenchmarkEnvironment(
 ) async throws {
     print("Warming up connection pool...")
     for _ in 0..<25 {
-        try await RawKV.insertOne(engine: engine, id: UUID().uuidString)
+        try await DirectStorageWorkload.insertOne(engine: engine, id: UUID().uuidString)
     }
     for _ in 0..<25 {
         var item = BenchmarkItem()
         item.name = "warmup"
-        try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+        try await DatabaseRecordWorkload.insertOne(container: container, item: item)
     }
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
     print("Warmup complete.\n")
 }
 
@@ -325,8 +325,8 @@ private func runSingleInsertBenchmark(
     engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
 
     let insertRunner = BenchmarkRunner(config: .init(
         warmupIterations: 15,
@@ -337,16 +337,16 @@ private func runSingleInsertBenchmark(
     ))
 
     let strategies: [Strategy] = [
-        (BenchmarkLayerContract.rawKV, {
+        (BenchmarkLayerContract.directStorage, {
             let id = UUID().uuidString
-            try await RawKV.insertOne(engine: engine, id: id)
+            try await DirectStorageWorkload.insertOne(engine: engine, id: id)
         }),
-        (BenchmarkLayerContract.fullFramework, {
+        (BenchmarkLayerContract.databaseRecordQueryAPI, {
             var item = BenchmarkItem()
             item.name = "Alice"
             item.age = 30
             item.score = 85.5
-            try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+            try await DatabaseRecordWorkload.insertOne(container: container, item: item)
         }),
     ]
     let result = try await compareStrategiesMedianOfPasses(
@@ -368,24 +368,24 @@ private func runBatchInsertBenchmark(
     container: DBContainer,
     batchSize: Int
 ) async throws {
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
 
     let size = batchSize
     let strategies: [Strategy] = [
-        (BenchmarkLayerContract.rawKV, {
-            try await RawKV.batchInsert(engine: engine, count: size)
+        (BenchmarkLayerContract.directStorage, {
+            try await DirectStorageWorkload.batchInsert(engine: engine, count: size)
         }),
-        (BenchmarkLayerContract.fullFramework, {
+        (BenchmarkLayerContract.databaseRecordQueryAPI, {
             var items: [BenchmarkItem] = []
             for i in 0..<size {
                 var item = BenchmarkItem()
                 item.name = "User \(i)"
-                item.age = 20 + (i % 60)
+                item.age = Int64(20 + (i % 60))
                 item.score = Double(50 + (i % 50))
                 items.append(item)
             }
-            try await FrameworkPostgreSQL.batchInsert(container: container, items: items)
+            try await DatabaseRecordWorkload.batchInsert(container: container, items: items)
         }),
     ]
     let result = try await runner.compareStrategies(name: "Batch Insert (\(batchSize) items)", strategies: strategies)
@@ -398,8 +398,8 @@ private func runPointReadBenchmark(
     engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
     let dataStore = try await container.store(for: BenchmarkItem.self)
 
     let pointReadRunner = BenchmarkRunner(config: .init(
@@ -412,44 +412,44 @@ private func runPointReadBenchmark(
 
     let seedCount = 5000
     let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
-    let rawIDs = try await RawKV.seedData(engine: engine, count: seedCount, idPrefix: "read-raw")
-    let parityIDs = try await ProfileBenchmark.seedFrameworkLayoutStorageData(
+    let directStorageIDs = try await DirectStorageWorkload.seedData(engine: engine, count: seedCount, idPrefix: "read-direct-storage")
+    let canonicalStorageIDs = try await ProfileBenchmark.seedCanonicalRecordStorageData(
         engine: engine,
         layout: layout,
         count: seedCount,
         idPrefix: "read-parity"
     )
-    let dataStoreIDs = try await FrameworkPostgreSQL.seedData(
+    let dataStoreIDs = try await DatabaseRecordWorkload.seedData(
         container: container,
         count: seedCount,
         idPrefix: "read-ds"
     )
-    let frameworkIDs = try await FrameworkPostgreSQL.seedData(
+    let databaseRecordIDs = try await DatabaseRecordWorkload.seedData(
         container: container,
         count: seedCount,
         idPrefix: "read-fw"
     )
-    let rawPool = CyclicIDPool(ids: rawIDs)
-    let parityPool = CyclicIDPool(ids: parityIDs)
+    let directStoragePool = CyclicIDPool(ids: directStorageIDs)
+    let canonicalStoragePool = CyclicIDPool(ids: canonicalStorageIDs)
     let dataStorePool = CyclicIDPool(ids: dataStoreIDs)
-    let frameworkPool = CyclicIDPool(ids: frameworkIDs)
+    let databaseRecordPool = CyclicIDPool(ids: databaseRecordIDs)
 
     let strategies: [Strategy] = [
-        (BenchmarkLayerContract.pointReadPresenceBaseline, {
-            _ = try await RawKV.readOne(engine: engine, id: rawPool.next())
+        (BenchmarkLayerContract.directStoragePresenceRead, {
+            _ = try await DirectStorageWorkload.readOne(engine: engine, id: directStoragePool.next())
         }),
-        (BenchmarkLayerContract.pointReadDecodeParity, {
-            _ = try await ProfileBenchmark.frameworkLayoutStorageDecodedRead(
+        (BenchmarkLayerContract.canonicalRecordDecodeRead, {
+            _ = try await ProfileBenchmark.canonicalRecordStorageRead(
                 engine: engine,
                 layout: layout,
-                id: parityPool.next()
+                id: canonicalStoragePool.next()
             )
         }),
-        (BenchmarkLayerContract.readDataStoreParity, {
+        (BenchmarkLayerContract.dataStoreRecordRead, {
             _ = try await dataStore.fetch(BenchmarkItem.self, id: dataStorePool.next())
         }),
-        (BenchmarkLayerContract.fullFramework, {
-            _ = try await FrameworkPostgreSQL.readOne(container: container, id: frameworkPool.next())
+        (BenchmarkLayerContract.databaseRecordQueryAPI, {
+            _ = try await DatabaseRecordWorkload.readOne(container: container, id: databaseRecordPool.next())
         }),
     ]
     let result = try await compareStrategiesMedianOfPasses(
@@ -472,8 +472,8 @@ private func runUpdateBenchmark(
     engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
     let dataStore = try await container.store(for: BenchmarkItem.self)
     let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
     let updateRunner = BenchmarkRunner(config: .init(
@@ -485,41 +485,40 @@ private func runUpdateBenchmark(
     ))
 
     let seedCount = 1024
-    let rawIDs = try await RawKV.seedData(engine: engine, count: seedCount, idPrefix: "update-raw")
-    let storageIDs = try await ProfileBenchmark.seedFrameworkLayoutStorageData(
+    let directStorageIDs = try await DirectStorageWorkload.seedData(engine: engine, count: seedCount, idPrefix: "update-direct-storage")
+    let storageIDs = try await ProfileBenchmark.seedCanonicalRecordStorageData(
         engine: engine,
         layout: layout,
         count: seedCount,
-        idPrefix: "update-layout"
+        idPrefix: "update-canonical-storage"
     )
-    let dataStoreIDs = try await FrameworkPostgreSQL.seedData(
+    let dataStoreIDs = try await DatabaseRecordWorkload.seedData(
         container: container,
         count: seedCount,
         idPrefix: "update-ds"
     )
-    let frameworkIDs = try await FrameworkPostgreSQL.seedData(
+    let databaseRecordIDs = try await DatabaseRecordWorkload.seedData(
         container: container,
         count: seedCount,
         idPrefix: "update-fw"
     )
-    let rawPool = CyclicIDPool(ids: rawIDs)
+    let directStoragePool = CyclicIDPool(ids: directStorageIDs)
     let storagePool = CyclicIDPool(ids: storageIDs)
     let dataStorePool = CyclicIDPool(ids: dataStoreIDs)
-    let frameworkPool = CyclicIDPool(ids: frameworkIDs)
+    let databaseRecordPool = CyclicIDPool(ids: databaseRecordIDs)
 
     let strategies: [Strategy] = [
-        (BenchmarkLayerContract.rawKV, {
-            try await RawKV.updateOne(engine: engine, id: rawPool.next())
+        (BenchmarkLayerContract.directStorage, {
+            try await DirectStorageWorkload.updateOne(engine: engine, id: directStoragePool.next())
         }),
-        (BenchmarkLayerContract.writeStorageParityBaseline, {
-            try await ProfileBenchmark.frameworkLayoutStorageWrite(
+        (BenchmarkLayerContract.canonicalRecordStorageMutation, {
+            try await ProfileBenchmark.canonicalRecordStorageWrite(
                 engine: engine,
                 layout: layout,
-                id: storagePool.next(),
-                isNewRecord: false
+                id: storagePool.next()
             )
         }),
-        (BenchmarkLayerContract.genericDataStoreBatchPath, {
+        (BenchmarkLayerContract.dataStoreBatchMutationAPI, {
             let id = dataStorePool.next()
             var item = BenchmarkItem()
             item.id = id
@@ -528,14 +527,14 @@ private func runUpdateBenchmark(
             item.score = 91.25
             try await dataStore.executeBatch(inserts: [item], deletes: [])
         }),
-        (BenchmarkLayerContract.fullFrameworkProductPath, {
-            let id = frameworkPool.next()
+        (BenchmarkLayerContract.databaseRecordMutationAPI, {
+            let id = databaseRecordPool.next()
             var item = BenchmarkItem()
             item.id = id
             item.name = "Updated Stable"
             item.age = 42
             item.score = 91.25
-            try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+            try await DatabaseRecordWorkload.updateOne(container: container, item: item)
         }),
     ]
     let result = try await compareStrategiesMedianOfPasses(
@@ -549,14 +548,14 @@ private func runUpdateBenchmark(
         strategies: strategies,
         rounds: 5
     )
-    printWriteProductParityAssessment(
+    printDatabaseRecordMutationAssessment(
         title: "Point Update",
         result: result,
         fixedMeasurements: fixedMeasurements,
-        productBaselineName: BenchmarkLayerContract.rawKV,
-        storageBaselineName: BenchmarkLayerContract.writeStorageParityBaseline,
-        genericPathName: BenchmarkLayerContract.genericDataStoreBatchPath,
-        productPathName: BenchmarkLayerContract.fullFrameworkProductPath
+        directStorageName: BenchmarkLayerContract.directStorage,
+        canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorageMutation,
+        dataStoreMutationName: BenchmarkLayerContract.dataStoreBatchMutationAPI,
+        databaseRecordMutationName: BenchmarkLayerContract.databaseRecordMutationAPI
     )
 }
 
@@ -565,8 +564,8 @@ private func runDeleteBenchmark(
     engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
     let dataStore = try await container.store(for: BenchmarkItem.self)
     let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
     let deleteRunner = BenchmarkRunner(config: .init(
@@ -577,32 +576,30 @@ private func runDeleteBenchmark(
         measureMemory: false
     ))
     let idCount = 1024
-    let rawPool = CyclicIDPool(ids: (0..<idCount).map { String(format: "delete-raw-%06d", $0) })
+    let directStoragePool = CyclicIDPool(ids: (0..<idCount).map { String(format: "delete-direct-storage-%06d", $0) })
     let dataStorePool = CyclicIDPool(ids: (0..<idCount).map { String(format: "delete-ds-%06d", $0) })
-    let frameworkPool = CyclicIDPool(ids: (0..<idCount).map { String(format: "delete-fw-%06d", $0) })
+    let databaseRecordPool = CyclicIDPool(ids: (0..<idCount).map { String(format: "delete-database-record-%06d", $0) })
 
     let strategies: [Strategy] = [
-        (BenchmarkLayerContract.rawKV, {
-            let id = rawPool.next()
-            try await RawKV.insertOne(engine: engine, id: id)
-            try await RawKV.deleteOne(engine: engine, id: id)
+        (BenchmarkLayerContract.directStorage, {
+            let id = directStoragePool.next()
+            try await DirectStorageWorkload.insertOne(engine: engine, id: id)
+            try await DirectStorageWorkload.deleteOne(engine: engine, id: id)
         }),
-        (BenchmarkLayerContract.writeStorageParityBaseline, {
+        (BenchmarkLayerContract.canonicalRecordStorageMutation, {
             let id = UUID().uuidString
-            try await ProfileBenchmark.frameworkLayoutStorageWrite(
+            try await ProfileBenchmark.canonicalRecordStorageWrite(
                 engine: engine,
                 layout: layout,
-                id: id,
-                isNewRecord: true
+                id: id
             )
-            try await ProfileBenchmark.frameworkLayoutStorageDelete(
+            try await ProfileBenchmark.canonicalRecordStorageDelete(
                 engine: engine,
                 layout: layout,
-                id: id,
-                skipBlobCleanup: true
+                id: id
             )
         }),
-        (BenchmarkLayerContract.genericDataStoreBatchPath, {
+        (BenchmarkLayerContract.dataStoreBatchMutationAPI, {
             var item = BenchmarkItem()
             item.id = dataStorePool.next()
             item.name = "Temp"
@@ -611,15 +608,15 @@ private func runDeleteBenchmark(
             try await dataStore.executeBatch(inserts: [item], deletes: [])
             try await dataStore.executeBatch(inserts: [], deletes: [item])
         }),
-        (BenchmarkLayerContract.fullFrameworkProductPath, {
-            let id = frameworkPool.next()
+        (BenchmarkLayerContract.databaseRecordMutationAPI, {
+            let id = databaseRecordPool.next()
             var item = BenchmarkItem()
             item.id = id
             item.name = "Temp"
             item.age = 30
             item.score = 50.0
-            try await FrameworkPostgreSQL.insertOne(container: container, item: item)
-            try await FrameworkPostgreSQL.deleteOne(container: container, id: id)
+            try await DatabaseRecordWorkload.insertOne(container: container, item: item)
+            try await DatabaseRecordWorkload.deleteOne(container: container, id: id)
         }),
     ]
     let result = try await compareStrategiesMedianOfPasses(
@@ -633,14 +630,14 @@ private func runDeleteBenchmark(
         strategies: strategies,
         rounds: 5
     )
-    printWriteProductParityAssessment(
+    printDatabaseRecordMutationAssessment(
         title: "Insert + Delete",
         result: result,
         fixedMeasurements: fixedMeasurements,
-        productBaselineName: BenchmarkLayerContract.rawKV,
-        storageBaselineName: BenchmarkLayerContract.writeStorageParityBaseline,
-        genericPathName: BenchmarkLayerContract.genericDataStoreBatchPath,
-        productPathName: BenchmarkLayerContract.fullFrameworkProductPath
+        directStorageName: BenchmarkLayerContract.directStorage,
+        canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorageMutation,
+        dataStoreMutationName: BenchmarkLayerContract.dataStoreBatchMutationAPI,
+        databaseRecordMutationName: BenchmarkLayerContract.databaseRecordMutationAPI
     )
 }
 
@@ -649,8 +646,8 @@ private func runPointDeleteBenchmark(
     engine: any StorageEngine,
     container: DBContainer
 ) async throws {
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
     let dataStore = try await container.store(for: BenchmarkItem.self)
     let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
     let deleteRunner = BenchmarkRunner(config: .init(
@@ -667,48 +664,47 @@ private func runPointDeleteBenchmark(
     comparePassResults.reserveCapacity(comparePasses)
 
     for pass in 0..<comparePasses {
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
-        let rawIDs = try await RawKV.seedData(
+        let directStorageIDs = try await DirectStorageWorkload.seedData(
             engine: engine,
             count: compareSeedCount,
-            idPrefix: "point-delete-raw-p\(pass)"
+            idPrefix: "point-delete-direct-storage-p\(pass)"
         )
-        let storageIDs = try await ProfileBenchmark.seedFrameworkLayoutStorageData(
+        let storageIDs = try await ProfileBenchmark.seedCanonicalRecordStorageData(
             engine: engine,
             layout: layout,
             count: compareSeedCount,
-            idPrefix: "point-delete-layout-p\(pass)"
+            idPrefix: "point-delete-canonical-storage-p\(pass)"
         )
-        let dataStoreIDs = try await FrameworkPostgreSQL.seedData(
+        let dataStoreIDs = try await DatabaseRecordWorkload.seedData(
             container: container,
             count: compareSeedCount,
             idPrefix: "point-delete-ds-p\(pass)"
         )
-        let frameworkIDs = try await FrameworkPostgreSQL.seedData(
+        let databaseRecordIDs = try await DatabaseRecordWorkload.seedData(
             container: container,
             count: compareSeedCount,
-            idPrefix: "point-delete-fw-p\(pass)"
+            idPrefix: "point-delete-database-record-p\(pass)"
         )
 
-        let compareRawPool = CyclicIDPool(ids: rawIDs)
+        let comparisonDirectStoragePool = CyclicIDPool(ids: directStorageIDs)
         let compareStoragePool = CyclicIDPool(ids: storageIDs)
         let compareDataStorePool = CyclicIDPool(ids: dataStoreIDs)
-        let compareFrameworkPool = CyclicIDPool(ids: frameworkIDs)
+        let comparisonDatabaseRecordPool = CyclicIDPool(ids: databaseRecordIDs)
         let compareStrategies: [Strategy] = [
-            (BenchmarkLayerContract.rawKV, {
-                try await RawKV.deleteOne(engine: engine, id: compareRawPool.next())
+            (BenchmarkLayerContract.directStorage, {
+                try await DirectStorageWorkload.deleteOne(engine: engine, id: comparisonDirectStoragePool.next())
             }),
-            (BenchmarkLayerContract.writeStorageParityBaseline, {
-                try await ProfileBenchmark.frameworkLayoutStorageDelete(
+            (BenchmarkLayerContract.canonicalRecordStorageMutation, {
+                try await ProfileBenchmark.canonicalRecordStorageDelete(
                     engine: engine,
                     layout: layout,
-                    id: compareStoragePool.next(),
-                    skipBlobCleanup: true
+                    id: compareStoragePool.next()
                 )
             }),
-            (BenchmarkLayerContract.genericDataStoreBatchPath, {
+            (BenchmarkLayerContract.dataStoreBatchMutationAPI, {
                 var item = BenchmarkItem()
                 item.id = compareDataStorePool.next()
                 item.name = "Temp"
@@ -716,8 +712,8 @@ private func runPointDeleteBenchmark(
                 item.score = 50.0
                 try await dataStore.executeBatch(inserts: [], deletes: [item])
             }),
-            (BenchmarkLayerContract.fullFrameworkProductPath, {
-                try await FrameworkPostgreSQL.deleteOne(container: container, id: compareFrameworkPool.next())
+            (BenchmarkLayerContract.databaseRecordMutationAPI, {
+                try await DatabaseRecordWorkload.deleteOne(container: container, id: comparisonDatabaseRecordPool.next())
             }),
         ]
         let rotatedStrategies = rotateStrategies(compareStrategies, by: pass)
@@ -735,43 +731,42 @@ private func runPointDeleteBenchmark(
     )
     ConsoleReporter.print(result)
 
-    try await RawKV.cleanup(engine: engine)
-    try await FrameworkPostgreSQL.cleanup(container: container)
+    try await DirectStorageWorkload.cleanup(engine: engine)
+    try await DatabaseRecordWorkload.cleanup(container: container)
     let fixedSeedCount = 5_000
-    let fixedRawPool = CyclicIDPool(ids: try await RawKV.seedData(
+    let fixedDirectStoragePool = CyclicIDPool(ids: try await DirectStorageWorkload.seedData(
         engine: engine,
         count: fixedSeedCount,
-        idPrefix: "point-delete-raw-fixed"
+        idPrefix: "point-delete-direct-storage-fixed"
     ))
-    let fixedStoragePool = CyclicIDPool(ids: try await ProfileBenchmark.seedFrameworkLayoutStorageData(
+    let fixedStoragePool = CyclicIDPool(ids: try await ProfileBenchmark.seedCanonicalRecordStorageData(
         engine: engine,
         layout: layout,
         count: fixedSeedCount,
-        idPrefix: "point-delete-layout-fixed"
+        idPrefix: "point-delete-canonical-storage-fixed"
     ))
-    let fixedDataStorePool = CyclicIDPool(ids: try await FrameworkPostgreSQL.seedData(
+    let fixedDataStorePool = CyclicIDPool(ids: try await DatabaseRecordWorkload.seedData(
         container: container,
         count: fixedSeedCount,
         idPrefix: "point-delete-ds-fixed"
     ))
-    let fixedFrameworkPool = CyclicIDPool(ids: try await FrameworkPostgreSQL.seedData(
+    let fixedDatabaseRecordPool = CyclicIDPool(ids: try await DatabaseRecordWorkload.seedData(
         container: container,
         count: fixedSeedCount,
-        idPrefix: "point-delete-fw-fixed"
+        idPrefix: "point-delete-database-record-fixed"
     ))
     let fixedStrategies: [Strategy] = [
-        (BenchmarkLayerContract.rawKV, {
-            try await RawKV.deleteOne(engine: engine, id: fixedRawPool.next())
+        (BenchmarkLayerContract.directStorage, {
+            try await DirectStorageWorkload.deleteOne(engine: engine, id: fixedDirectStoragePool.next())
         }),
-        (BenchmarkLayerContract.writeStorageParityBaseline, {
-            try await ProfileBenchmark.frameworkLayoutStorageDelete(
+        (BenchmarkLayerContract.canonicalRecordStorageMutation, {
+            try await ProfileBenchmark.canonicalRecordStorageDelete(
                 engine: engine,
                 layout: layout,
-                id: fixedStoragePool.next(),
-                skipBlobCleanup: true
+                id: fixedStoragePool.next()
             )
         }),
-        (BenchmarkLayerContract.genericDataStoreBatchPath, {
+        (BenchmarkLayerContract.dataStoreBatchMutationAPI, {
             var item = BenchmarkItem()
             item.id = fixedDataStorePool.next()
             item.name = "Temp"
@@ -779,8 +774,8 @@ private func runPointDeleteBenchmark(
             item.score = 50.0
             try await dataStore.executeBatch(inserts: [], deletes: [item])
         }),
-        (BenchmarkLayerContract.fullFrameworkProductPath, {
-            try await FrameworkPostgreSQL.deleteOne(container: container, id: fixedFrameworkPool.next())
+        (BenchmarkLayerContract.databaseRecordMutationAPI, {
+            try await DatabaseRecordWorkload.deleteOne(container: container, id: fixedDatabaseRecordPool.next())
         }),
     ]
     let fixedMeasurements = try await FixedIterationReporter.print(
@@ -788,14 +783,14 @@ private func runPointDeleteBenchmark(
         strategies: fixedStrategies,
         rounds: 5
     )
-    printWriteProductParityAssessment(
+    printDatabaseRecordMutationAssessment(
         title: "Point Delete",
         result: result,
         fixedMeasurements: fixedMeasurements,
-        productBaselineName: BenchmarkLayerContract.rawKV,
-        storageBaselineName: BenchmarkLayerContract.writeStorageParityBaseline,
-        genericPathName: BenchmarkLayerContract.genericDataStoreBatchPath,
-        productPathName: BenchmarkLayerContract.fullFrameworkProductPath
+        directStorageName: BenchmarkLayerContract.directStorage,
+        canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorageMutation,
+        dataStoreMutationName: BenchmarkLayerContract.dataStoreBatchMutationAPI,
+        databaseRecordMutationName: BenchmarkLayerContract.databaseRecordMutationAPI
     )
 }
 
@@ -805,64 +800,64 @@ private func printPointReadTargetAssessment(
 ) {
     guard
         let presenceMetrics = result.strategies.first(where: {
-            $0.name == BenchmarkLayerContract.pointReadPresenceBaseline
+            $0.name == BenchmarkLayerContract.directStoragePresenceRead
         })?.metrics.throughput?.opsPerSecond,
-        let decodeParityMetrics = result.strategies.first(where: {
-            $0.name == BenchmarkLayerContract.pointReadDecodeParity
+        let canonicalRecordDecodeThroughput = result.strategies.first(where: {
+            $0.name == BenchmarkLayerContract.canonicalRecordDecodeRead
         })?.metrics.throughput?.opsPerSecond,
         let dataStoreMetrics = result.strategies.first(where: {
-            $0.name == BenchmarkLayerContract.readDataStoreParity
+            $0.name == BenchmarkLayerContract.dataStoreRecordRead
         })?.metrics.throughput?.opsPerSecond,
-        let frameworkMetrics = result.strategies.first(where: {
-            $0.name == BenchmarkLayerContract.fullFramework
+        let databaseRecordMetrics = result.strategies.first(where: {
+            $0.name == BenchmarkLayerContract.databaseRecordQueryAPI
         })?.metrics.throughput?.opsPerSecond,
         let presenceFixed = fixedMeasurements.first(where: {
-            $0.name == BenchmarkLayerContract.pointReadPresenceBaseline
-        })?.averageMicros,
-        let decodeParityFixed = fixedMeasurements.first(where: {
-            $0.name == BenchmarkLayerContract.pointReadDecodeParity
-        })?.averageMicros,
+            $0.name == BenchmarkLayerContract.directStoragePresenceRead
+        })?.averageMicroseconds,
+        let canonicalRecordDecodeMicroseconds = fixedMeasurements.first(where: {
+            $0.name == BenchmarkLayerContract.canonicalRecordDecodeRead
+        })?.averageMicroseconds,
         let dataStoreFixed = fixedMeasurements.first(where: {
-            $0.name == BenchmarkLayerContract.readDataStoreParity
-        })?.averageMicros,
-        let frameworkFixed = fixedMeasurements.first(where: {
-            $0.name == BenchmarkLayerContract.fullFramework
-        })?.averageMicros,
+            $0.name == BenchmarkLayerContract.dataStoreRecordRead
+        })?.averageMicroseconds,
+        let databaseRecordFixed = fixedMeasurements.first(where: {
+            $0.name == BenchmarkLayerContract.databaseRecordQueryAPI
+        })?.averageMicroseconds,
         presenceMetrics > 0,
-        decodeParityMetrics > 0,
+        canonicalRecordDecodeThroughput > 0,
         dataStoreMetrics > 0
     else {
         return
     }
 
-    let strictThroughputOverheadPct = ((presenceMetrics - frameworkMetrics) / presenceMetrics) * 100
-    let storageBaselineGapPct = ((presenceMetrics - decodeParityMetrics) / presenceMetrics) * 100
-    let storageToDataStoreThroughputPct = ((decodeParityMetrics - dataStoreMetrics) / decodeParityMetrics) * 100
-    let dataStoreToFrameworkThroughputPct = ((dataStoreMetrics - frameworkMetrics) / dataStoreMetrics) * 100
-    let strictFixedDelta = frameworkFixed - presenceFixed
-    let storageBaselineFixedDelta = decodeParityFixed - presenceFixed
-    let storageToDataStoreFixedDelta = dataStoreFixed - decodeParityFixed
-    let dataStoreToFrameworkFixedDelta = frameworkFixed - dataStoreFixed
+    let directStorageToDatabaseRecordThroughputGapPercent = ((presenceMetrics - databaseRecordMetrics) / presenceMetrics) * 100
+    let canonicalStorageGapPercent = ((presenceMetrics - canonicalRecordDecodeThroughput) / presenceMetrics) * 100
+    let storageToDataStoreThroughputPercent = ((canonicalRecordDecodeThroughput - dataStoreMetrics) / canonicalRecordDecodeThroughput) * 100
+    let dataStoreToDatabaseRecordThroughputPercent = ((dataStoreMetrics - databaseRecordMetrics) / dataStoreMetrics) * 100
+    let directStorageToDatabaseRecordFixedDelta = databaseRecordFixed - presenceFixed
+    let canonicalStorageFixedDelta = canonicalRecordDecodeMicroseconds - presenceFixed
+    let storageToDataStoreFixedDelta = dataStoreFixed - canonicalRecordDecodeMicroseconds
+    let dataStoreToDatabaseRecordFixedDelta = databaseRecordFixed - dataStoreFixed
     let tolerance = 0.05
 
     print("  Point Read Target vs Actual")
     print("  " + String(repeating: "-", count: 52))
     print("  Strict Gap")
     print("  " + String(repeating: "-", count: 52))
-    print("  Raw presence -> Full Framework throughput gap: \(String(format: "%.2f", strictThroughputOverheadPct))%")
-    print("  Raw presence -> Full Framework fixed delta: \(String(format: "%+.2f", strictFixedDelta)) us/op")
+    print("  Direct storage presence -> database record query throughput gap: \(String(format: "%.2f", directStorageToDatabaseRecordThroughputGapPercent))%")
+    print("  Direct storage presence -> database record query fixed delta: \(String(format: "%+.2f", directStorageToDatabaseRecordFixedDelta)) us/op")
     print("")
     print("  Storage Parity Summary")
     print("  " + String(repeating: "-", count: 52))
-    print("  Raw presence -> storage-stack parity throughput gap: \(String(format: "%.2f", storageBaselineGapPct))%")
-    print("  Raw presence -> storage-stack parity fixed delta: \(String(format: "%+.2f", storageBaselineFixedDelta)) us/op")
-    print("  \(formatPointReadTargetLine(label: "Storage-stack parity -> DataStore.fetch() throughput target <= 10%", delta: storageToDataStoreThroughputPct, unit: "%", tolerance: 10 + tolerance))")
-    print("  \(formatPointReadTargetLine(label: "Storage-stack parity -> DataStore.fetch() fixed target <= 20 us/op", delta: storageToDataStoreFixedDelta, unit: " us/op", tolerance: 20 + tolerance))")
+    print("  Direct storage presence -> canonical record decode throughput gap: \(String(format: "%.2f", canonicalStorageGapPercent))%")
+    print("  Direct storage presence -> canonical record decode fixed delta: \(String(format: "%+.2f", canonicalStorageFixedDelta)) us/op")
+    print("  \(formatPointReadTargetLine(label: "Canonical record decode -> DataStore record read throughput target <= 10%", delta: storageToDataStoreThroughputPercent, unit: "%", tolerance: 10 + tolerance))")
+    print("  \(formatPointReadTargetLine(label: "Canonical record decode -> DataStore record read fixed target <= 20 us/op", delta: storageToDataStoreFixedDelta, unit: " us/op", tolerance: 20 + tolerance))")
     print("")
     print("  Context Parity Summary")
     print("  " + String(repeating: "-", count: 52))
-    print("  \(formatPointReadTargetLine(label: "DataStore.fetch() -> Full Framework throughput target <= 10%", delta: dataStoreToFrameworkThroughputPct, unit: "%", tolerance: 10 + tolerance))")
-    print("  \(formatPointReadTargetLine(label: "DataStore.fetch() -> Full Framework fixed target <= 20 us/op", delta: dataStoreToFrameworkFixedDelta, unit: " us/op", tolerance: 20 + tolerance))")
+    print("  \(formatPointReadTargetLine(label: "DataStore record read -> database record query throughput target <= 10%", delta: dataStoreToDatabaseRecordThroughputPercent, unit: "%", tolerance: 10 + tolerance))")
+    print("  \(formatPointReadTargetLine(label: "DataStore record read -> database record query fixed target <= 20 us/op", delta: dataStoreToDatabaseRecordFixedDelta, unit: " us/op", tolerance: 20 + tolerance))")
     print("")
 }
 
@@ -978,7 +973,7 @@ private func printParityAssessment(
     title: String,
     result: StrategyComparisonResult,
     fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
-    storageBaselineName: String,
+    canonicalStorageName: String,
     dataStoreName: String,
     contextName: String
 ) {
@@ -988,7 +983,7 @@ private func printParityAssessment(
         heading: "Storage Parity Summary",
         result: result,
         fixedMeasurements: fixedMeasurements,
-        baselineName: storageBaselineName,
+        baselineName: canonicalStorageName,
         candidateName: dataStoreName
     )
     printTargetAssessmentSection(
@@ -1000,28 +995,28 @@ private func printParityAssessment(
     )
 }
 
-private func printWriteProductParityAssessment(
+private func printDatabaseRecordMutationAssessment(
     title: String,
     result: StrategyComparisonResult,
     fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
-    productBaselineName: String,
-    storageBaselineName: String,
-    genericPathName: String,
-    productPathName: String,
-    throughputTargetOverheadPct: Double = 10.0,
-    fixedTargetDeltaMicros: Double = 20.0,
+    directStorageName: String,
+    canonicalStorageName: String,
+    dataStoreMutationName: String,
+    databaseRecordMutationName: String,
+    throughputTargetOverheadPercent: Double = 10.0,
+    fixedTargetDeltaMicroseconds: Double = 20.0,
     tolerance: Double = 0.05
 ) {
-    print("  \(title) \(BenchmarkLayerContract.productParitySummary)")
+    print("  \(title) \(BenchmarkLayerContract.databaseRecordParitySummary)")
     print("  " + String(repeating: "-", count: 52))
     printTargetAssessmentSection(
-        heading: BenchmarkLayerContract.productParitySummary,
+        heading: BenchmarkLayerContract.databaseRecordParitySummary,
         result: result,
         fixedMeasurements: fixedMeasurements,
-        baselineName: productBaselineName,
-        candidateName: productPathName,
-        throughputTargetOverheadPct: throughputTargetOverheadPct,
-        fixedTargetDeltaMicros: fixedTargetDeltaMicros,
+        baselineName: directStorageName,
+        candidateName: databaseRecordMutationName,
+        throughputTargetOverheadPercent: throughputTargetOverheadPercent,
+        fixedTargetDeltaMicroseconds: fixedTargetDeltaMicroseconds,
         tolerance: tolerance
     )
 
@@ -1031,16 +1026,16 @@ private func printWriteProductParityAssessment(
         heading: "Storage diagnostic",
         result: result,
         fixedMeasurements: fixedMeasurements,
-        baselineName: storageBaselineName,
-        candidateName: genericPathName
+        baselineName: canonicalStorageName,
+        candidateName: dataStoreMutationName
     )
     printWriteDiagnosticSection(
-        heading: "Context/product diagnostic",
+        heading: "Database record mutation diagnostic",
         result: result,
         fixedMeasurements: fixedMeasurements,
-        baselineName: genericPathName,
-        candidateName: productPathName,
-        expectedFastPathWin: true
+        baselineName: dataStoreMutationName,
+        candidateName: databaseRecordMutationName,
+        expectsDatabaseRecordAdvantage: true
     )
 }
 
@@ -1050,8 +1045,8 @@ private func printTargetAssessmentSection(
     fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
     baselineName: String,
     candidateName: String,
-    throughputTargetOverheadPct: Double = 10.0,
-    fixedTargetDeltaMicros: Double = 20.0,
+    throughputTargetOverheadPercent: Double = 10.0,
+    fixedTargetDeltaMicroseconds: Double = 20.0,
     tolerance: Double = 0.05
 ) {
     guard
@@ -1066,13 +1061,13 @@ private func printTargetAssessmentSection(
         return
     }
 
-    let throughputOverheadPct = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
-    let fixedDelta = fixedCandidate.averageMicros - fixedBaseline.averageMicros
+    let throughputOverheadPercent = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
+    let fixedDelta = fixedCandidate.averageMicroseconds - fixedBaseline.averageMicroseconds
 
     print("  \(heading)")
     print("  " + String(repeating: "-", count: 52))
-    print("  \(formatPointReadTargetLine(label: "\(baselineName) -> \(candidateName) throughput target <= \(Int(throughputTargetOverheadPct))%", delta: throughputOverheadPct, unit: "%", tolerance: throughputTargetOverheadPct + tolerance))")
-    print("  \(formatPointReadTargetLine(label: "\(baselineName) -> \(candidateName) fixed target <= \(Int(fixedTargetDeltaMicros)) us/op", delta: fixedDelta, unit: " us/op", tolerance: fixedTargetDeltaMicros + tolerance))")
+    print("  \(formatPointReadTargetLine(label: "\(baselineName) -> \(candidateName) throughput target <= \(Int(throughputTargetOverheadPercent))%", delta: throughputOverheadPercent, unit: "%", tolerance: throughputTargetOverheadPercent + tolerance))")
+    print("  \(formatPointReadTargetLine(label: "\(baselineName) -> \(candidateName) fixed target <= \(Int(fixedTargetDeltaMicroseconds)) us/op", delta: fixedDelta, unit: " us/op", tolerance: fixedTargetDeltaMicroseconds + tolerance))")
     print("")
 }
 
@@ -1082,7 +1077,7 @@ private func printWriteDiagnosticSection(
     fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
     baselineName: String,
     candidateName: String,
-    expectedFastPathWin: Bool = false
+    expectsDatabaseRecordAdvantage: Bool = false
 ) {
     guard
         let baseline = result.strategies.first(where: { $0.name == baselineName }),
@@ -1096,13 +1091,13 @@ private func printWriteDiagnosticSection(
         return
     }
 
-    let throughputDeltaPct = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
-    let fixedDelta = fixedCandidate.averageMicros - fixedBaseline.averageMicros
+    let throughputDeltaPercent = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
+    let fixedDelta = fixedCandidate.averageMicroseconds - fixedBaseline.averageMicroseconds
 
     print("  \(heading)")
     print("  " + String(repeating: "-", count: 52))
-    print("  \(baselineName) -> \(candidateName) throughput delta: \(formatWriteDiagnosticLine(delta: throughputDeltaPct, unit: "%", expectedFastPathWin: expectedFastPathWin))")
-    print("  \(baselineName) -> \(candidateName) fixed delta: \(formatWriteDiagnosticLine(delta: fixedDelta, unit: " us/op", expectedFastPathWin: expectedFastPathWin))")
+    print("  \(baselineName) -> \(candidateName) throughput delta: \(formatWriteDiagnosticLine(delta: throughputDeltaPercent, unit: "%", expectsDatabaseRecordAdvantage: expectsDatabaseRecordAdvantage))")
+    print("  \(baselineName) -> \(candidateName) fixed delta: \(formatWriteDiagnosticLine(delta: fixedDelta, unit: " us/op", expectsDatabaseRecordAdvantage: expectsDatabaseRecordAdvantage))")
     print("")
 }
 
@@ -1113,7 +1108,7 @@ private func formatPointReadTargetLine(
     tolerance: Double
 ) -> String {
     if delta <= 0 {
-        return "\(label): framework faster by \(String(format: "%.2f", abs(delta)))\(unit) [PASS]"
+        return "\(label): candidate faster by \(String(format: "%.2f", abs(delta)))\(unit) [PASS]"
     }
     return "\(label): actual \(String(format: "%.2f", delta))\(unit) [\(delta <= tolerance ? "PASS" : "MISS")]"
 }
@@ -1121,10 +1116,10 @@ private func formatPointReadTargetLine(
 private func formatWriteDiagnosticLine(
     delta: Double,
     unit: String,
-    expectedFastPathWin: Bool
+    expectsDatabaseRecordAdvantage: Bool
 ) -> String {
     if delta < 0 {
-        let suffix = expectedFastPathWin ? " (expected product fast-path win)" : ""
+        let suffix = expectsDatabaseRecordAdvantage ? " (expected database record API advantage)" : ""
         return "faster by \(String(format: "%.2f", abs(delta)))\(unit)\(suffix)"
     }
     return "slower by \(String(format: "%.2f", delta))\(unit)"

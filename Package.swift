@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.4
 import PackageDescription
 
 let package = Package(
@@ -8,7 +8,8 @@ let package = Package(
         // Use the adjacent local checkout so benchmark runs against in-flight framework changes.
         .package(path: "../database-framework", traits: ["PostgreSQL"]),
         .package(path: "../database-kit"),
-        .package(path: "../storage-kit", traits: ["PostgreSQL"]),
+        .package(path: "../storage-kit"),
+        .package(path: "../database-types"),
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.25.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.7.0"),
     ],
@@ -17,10 +18,17 @@ let package = Package(
             name: "DatabaseBenchmark",
             dependencies: [
                 .product(name: "DatabaseEngine", package: "database-framework"),
+                .product(name: "DatabaseRuntime", package: "database-framework"),
+                .product(
+                    name: "DatabaseServerFoundation",
+                    package: "database-framework"
+                ),
                 .product(name: "ScalarIndex", package: "database-framework"),
                 .product(name: "BenchmarkFramework", package: "database-framework"),
-                .product(name: "Core", package: "database-kit"),
+                .product(name: "DatabaseKit", package: "database-kit"),
                 .product(name: "StorageKit", package: "storage-kit"),
+                .product(name: "StorageKitSystemClock", package: "storage-kit"),
+                .product(name: "DatabaseTypes", package: "database-types"),
                 .product(name: "PostgreSQLStorage", package: "storage-kit"),
                 .product(name: "PostgresNIO", package: "postgres-nio"),
                 .product(name: "Logging", package: "swift-log"),
@@ -31,7 +39,7 @@ let package = Package(
             dependencies: [
                 "DatabaseBenchmark",
                 .product(name: "DatabaseEngine", package: "database-framework"),
-                .product(name: "Core", package: "database-kit"),
+                .product(name: "DatabaseKit", package: "database-kit"),
                 .product(name: "StorageKit", package: "storage-kit"),
             ]
         ),

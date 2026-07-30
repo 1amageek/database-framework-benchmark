@@ -1,5 +1,4 @@
 import Foundation
-import PostgresNIO
 import PostgreSQLStorage
 
 /// PostgreSQL connection configuration for benchmarks.
@@ -43,19 +42,7 @@ struct BenchmarkConfig: Sendable {
         )
     }
 
-    /// PostgresNIO client configuration for raw benchmarks
-    var postgresClientConfig: PostgresClient.Configuration {
-        PostgresClient.Configuration(
-            host: host,
-            port: port,
-            username: username,
-            password: password,
-            database: database,
-            tls: .disable
-        )
-    }
-
-    /// PostgreSQLStorage configuration for framework benchmarks
+    /// Configuration for the shared benchmark storage engine.
     var storageConfig: PostgreSQLConfiguration {
         PostgreSQLConfiguration(
             host: host,

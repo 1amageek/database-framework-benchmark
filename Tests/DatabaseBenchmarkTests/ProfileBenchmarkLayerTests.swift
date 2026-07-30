@@ -1,7 +1,7 @@
 import Testing
 import StorageKit
 import DatabaseEngine
-import Core
+import DatabaseKit
 @testable import DatabaseBenchmark
 
 @Suite("ProfileBenchmark Layer Tests")
@@ -12,12 +12,13 @@ struct ProfileBenchmarkLayerTests {
         return try await DBContainer(
             for: schema,
             configuration: .init(backend: .custom(engine)),
+            runtimeConfiguration: try DatabaseRuntimeConfiguration(),
             security: .disabled
         )
     }
 
-    @Test("canonical framework key matches resolved items subspace packing")
-    func canonicalFrameworkKeyMatchesResolvedLayout() async throws {
+    @Test("canonical item key matches resolved items subspace packing")
+    func canonicalItemKeyMatchesResolvedLayout() async throws {
         let container = try await makeContainer()
         let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
         let id = "layout-test"
@@ -28,55 +29,54 @@ struct ProfileBenchmarkLayerTests {
             .subspace(BenchmarkItem.persistableType)
             .pack(Tuple([id]))
 
-        #expect(ProfileBenchmark.benchmarkKeyBytes(layout: layout, id: id) == expected)
+        #expect(ProfileBenchmark.canonicalItemKey(layout: layout, id: id) == expected)
     }
 
-    @Test("read L1 framework key differs from ad hoc raw key baseline")
-    func frameworkReadKeyDiffersFromAdHocBaseline() async throws {
+    @Test("canonical item key differs from the ad hoc storage key")
+    func canonicalKeyDiffersFromAdHocStorageKey() async throws {
         let container = try await makeContainer()
         let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
         let id = "read-key"
 
-        let frameworkKey = ProfileBenchmark.benchmarkKeyBytes(layout: layout, id: id)
-        let rawKey = ProfileBenchmark.rawAdHocKeyBytes(id: id)
+        let canonicalKey = ProfileBenchmark.canonicalItemKey(layout: layout, id: id)
+        let adHocStorageKey = ProfileBenchmark.adHocItemKey(id: id)
 
-        #expect(frameworkKey != rawKey)
+        #expect(canonicalKey != adHocStorageKey)
     }
 
-    @Test("framework layout storage helpers round-trip and delete via canonical layout")
-    func frameworkLayoutStorageHelpersRoundTrip() async throws {
+    @Test("canonical record storage round-trips and deletes")
+    func canonicalRecordStorageRoundTripsAndDeletes() async throws {
         let engine = InMemoryEngine()
         let schema = Schema([BenchmarkItem.self], version: .init(1, 0, 0))
         let container = try await DBContainer(
             for: schema,
             configuration: .init(backend: .custom(engine)),
+            runtimeConfiguration: try DatabaseRuntimeConfiguration(),
             security: .disabled
         )
         let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
         let id = "roundtrip"
 
-        try await ProfileBenchmark.frameworkLayoutStorageWrite(
+        try await ProfileBenchmark.canonicalRecordStorageWrite(
             engine: engine,
             layout: layout,
-            id: id,
-            isNewRecord: true
+            id: id
         )
 
-        let item = try await ProfileBenchmark.frameworkLayoutStorageDecodedRead(
+        let item = try await ProfileBenchmark.canonicalRecordStorageRead(
             engine: engine,
             layout: layout,
             id: id
         )
         #expect(item?.id == id)
 
-        try await ProfileBenchmark.frameworkLayoutStorageDelete(
+        try await ProfileBenchmark.canonicalRecordStorageDelete(
             engine: engine,
             layout: layout,
-            id: id,
-            skipBlobCleanup: false
+            id: id
         )
 
-        let deleted = try await ProfileBenchmark.frameworkLayoutStorageDecodedRead(
+        let deleted = try await ProfileBenchmark.canonicalRecordStorageRead(
             engine: engine,
             layout: layout,
             id: id
@@ -84,18 +84,19 @@ struct ProfileBenchmarkLayerTests {
         #expect(deleted == nil)
     }
 
-    @Test("decode parity seed helper writes canonical layout records that decode correctly")
-    func decodeParitySeedHelperRoundTrips() async throws {
+    @Test("seeded canonical records decode through the storage stack")
+    func seededCanonicalRecordsRoundTrip() async throws {
         let engine = InMemoryEngine()
         let schema = Schema([BenchmarkItem.self], version: .init(1, 0, 0))
         let container = try await DBContainer(
             for: schema,
             configuration: .init(backend: .custom(engine)),
+            runtimeConfiguration: try DatabaseRuntimeConfiguration(),
             security: .disabled
         )
         let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
 
-        let ids = try await ProfileBenchmark.seedFrameworkLayoutStorageData(
+        let ids = try await ProfileBenchmark.seedCanonicalRecordStorageData(
             engine: engine,
             layout: layout,
             count: 3,
@@ -104,7 +105,7 @@ struct ProfileBenchmarkLayerTests {
 
         #expect(ids.count == 3)
 
-        let item = try await ProfileBenchmark.frameworkLayoutStorageDecodedRead(
+        let item = try await ProfileBenchmark.canonicalRecordStorageRead(
             engine: engine,
             layout: layout,
             id: ids[1]
@@ -114,61 +115,61 @@ struct ProfileBenchmarkLayerTests {
 
     @Test("layer labels are stable and explicit about their contracts")
     func layerLabelsAreStable() {
-        #expect(BenchmarkLayerContract.rawKV == "Raw KV")
-        #expect(BenchmarkLayerContract.fullFramework == "Full Framework")
-        #expect(BenchmarkLayerContract.writeStorageParityBaseline == "Storage parity baseline")
-        #expect(BenchmarkLayerContract.genericDataStoreBatchPath == "Generic DataStore batch path")
-        #expect(BenchmarkLayerContract.fullFrameworkProductPath == "Full Framework (product path)")
-        #expect(BenchmarkLayerContract.writeL1 == "L1: Raw KV (ad hoc key, bytes only)")
-        #expect(BenchmarkLayerContract.readL1 == "L1: Raw KV (framework key only)")
-        #expect(BenchmarkLayerContract.l2 == "L2: Raw KV + framework layout + storage stack")
-        #expect(BenchmarkLayerContract.writeL3 == "L3: Generic DataStore batch path")
-        #expect(BenchmarkLayerContract.writeL4 == "L4: Full Framework product path")
-        #expect(BenchmarkLayerContract.pointReadPresenceBaseline == "Raw KV (presence only)")
-        #expect(BenchmarkLayerContract.pointReadDecodeParity == "Raw KV + storage-stack decode parity")
-        #expect(BenchmarkLayerContract.readDataStoreParity == "DataStore.fetch() parity")
-        #expect(BenchmarkLayerContract.genericDataStoreBatchPathProfile == "Generic DataStore batch path")
-        #expect(BenchmarkLayerContract.fullFrameworkProductPathProfile == "Full Framework product path")
-        #expect(BenchmarkLayerContract.reusedContextParity == "FDBContext parity (reused)")
-        #expect(BenchmarkLayerContract.freshContextParity == "FDBContext parity (fresh)")
-        #expect(BenchmarkLayerContract.l1ToL2Description == "framework layout + storage stack")
-        #expect(BenchmarkLayerContract.writeL2ToL3Description == "generic batch abstraction delta")
-        #expect(BenchmarkLayerContract.writeL3ToL4Description == "product fast-path delta")
-        #expect(BenchmarkLayerContract.readL2ToL3Description == "storage parity")
-        #expect(BenchmarkLayerContract.readL3ToL4Description == "context parity")
-        #expect(BenchmarkLayerContract.productParitySummary == "Product parity summary")
+        #expect(BenchmarkLayerContract.directStorage == "Direct storage")
+        #expect(BenchmarkLayerContract.databaseRecordQueryAPI == "Database record query API")
+        #expect(BenchmarkLayerContract.canonicalRecordStorageMutation == "Canonical record storage mutation")
+        #expect(BenchmarkLayerContract.dataStoreBatchMutationAPI == "DataStore batch mutation API")
+        #expect(BenchmarkLayerContract.databaseRecordMutationAPI == "Database record mutation API")
+        #expect(BenchmarkLayerContract.directStorageMutation == "L1: Direct storage mutation")
+        #expect(BenchmarkLayerContract.canonicalKeyPresenceRead == "L1: Canonical-key presence read")
+        #expect(BenchmarkLayerContract.canonicalRecordStorage == "L2: Canonical record storage")
+        #expect(BenchmarkLayerContract.dataStoreBatchMutation == "L3: DataStore batch mutation")
+        #expect(BenchmarkLayerContract.databaseRecordMutation == "L4: Database record mutation")
+        #expect(BenchmarkLayerContract.directStoragePresenceRead == "Direct storage presence read")
+        #expect(BenchmarkLayerContract.canonicalRecordDecodeRead == "Canonical record decode read")
+        #expect(BenchmarkLayerContract.dataStoreRecordRead == "DataStore record read")
+        #expect(BenchmarkLayerContract.dataStoreBatchMutationProfile == "DataStore batch mutation")
+        #expect(BenchmarkLayerContract.databaseRecordMutationProfile == "Database record mutation")
+        #expect(BenchmarkLayerContract.reusedContextRecordRead == "Reused-context record read")
+        #expect(BenchmarkLayerContract.freshContextRecordRead == "Fresh-context record read")
+        #expect(BenchmarkLayerContract.storageEncodingTransitionDescription == "record encoding and storage")
+        #expect(BenchmarkLayerContract.dataStoreBatchTransitionDescription == "DataStore batch mutation")
+        #expect(BenchmarkLayerContract.databaseRecordMutationTransitionDescription == "database record mutation")
+        #expect(BenchmarkLayerContract.dataStoreReadTransitionDescription == "DataStore record read")
+        #expect(BenchmarkLayerContract.contextReadTransitionDescription == "context identity resolution")
+        #expect(BenchmarkLayerContract.databaseRecordParitySummary == "Database Record Parity Summary")
         #expect(BenchmarkLayerContract.diagnosticBreakdown == "Diagnostic breakdown")
         #expect(BenchmarkLayerContract.storageParitySummary == "Storage Parity Summary")
         #expect(BenchmarkLayerContract.contextParitySummary == "Context Parity Summary")
         #expect(BenchmarkLayerContract.readProfileLabels == [
-            BenchmarkLayerContract.readL1,
-            BenchmarkLayerContract.l2,
-            BenchmarkLayerContract.readDataStoreParity,
-            BenchmarkLayerContract.fullFramework,
+            BenchmarkLayerContract.canonicalKeyPresenceRead,
+            BenchmarkLayerContract.canonicalRecordStorage,
+            BenchmarkLayerContract.dataStoreRecordRead,
+            BenchmarkLayerContract.databaseRecordQueryAPI,
         ])
         #expect(BenchmarkLayerContract.pointReadCompareLabels == [
-            BenchmarkLayerContract.pointReadPresenceBaseline,
-            BenchmarkLayerContract.pointReadDecodeParity,
-            BenchmarkLayerContract.readDataStoreParity,
-            BenchmarkLayerContract.fullFramework,
+            BenchmarkLayerContract.directStoragePresenceRead,
+            BenchmarkLayerContract.canonicalRecordDecodeRead,
+            BenchmarkLayerContract.dataStoreRecordRead,
+            BenchmarkLayerContract.databaseRecordQueryAPI,
         ])
         #expect(BenchmarkLayerContract.writeCompareLabels == [
-            BenchmarkLayerContract.rawKV,
-            BenchmarkLayerContract.writeStorageParityBaseline,
-            BenchmarkLayerContract.genericDataStoreBatchPath,
-            BenchmarkLayerContract.fullFrameworkProductPath,
+            BenchmarkLayerContract.directStorage,
+            BenchmarkLayerContract.canonicalRecordStorageMutation,
+            BenchmarkLayerContract.dataStoreBatchMutationAPI,
+            BenchmarkLayerContract.databaseRecordMutationAPI,
         ])
         #expect(BenchmarkLayerContract.writeProfileLabels == [
-            BenchmarkLayerContract.writeL1,
-            BenchmarkLayerContract.l2,
-            BenchmarkLayerContract.writeL3,
-            BenchmarkLayerContract.writeL4,
+            BenchmarkLayerContract.directStorageMutation,
+            BenchmarkLayerContract.canonicalRecordStorage,
+            BenchmarkLayerContract.dataStoreBatchMutation,
+            BenchmarkLayerContract.databaseRecordMutation,
         ])
         #expect(BenchmarkLayerContract.deleteProfileLabels == [
-            BenchmarkLayerContract.writeL1,
-            BenchmarkLayerContract.l2,
-            BenchmarkLayerContract.writeL3,
-            BenchmarkLayerContract.writeL4,
+            BenchmarkLayerContract.directStorageMutation,
+            BenchmarkLayerContract.canonicalRecordStorage,
+            BenchmarkLayerContract.dataStoreBatchMutation,
+            BenchmarkLayerContract.databaseRecordMutation,
         ])
     }
 }

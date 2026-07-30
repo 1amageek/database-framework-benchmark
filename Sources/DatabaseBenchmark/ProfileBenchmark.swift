@@ -2,7 +2,8 @@ import Foundation
 import BenchmarkFramework
 import StorageKit
 import DatabaseEngine
-import Core
+import DatabaseKit
+import DatabaseTypes
 import Logging
 import Synchronization
 
@@ -10,30 +11,48 @@ private let logger = Logger(label: "benchmark.profile")
 
 // MARK: - Phase Timing
 
-/// Measures individual phases of the framework's write path.
+/// Measures the observable phases of canonical record operations.
 ///
 /// The insert call chain:
 /// ```
-/// FDBContext.init → insert() → save()
+/// DatabaseContext.init → insert() → save()
 ///   → TransactionRunner → StorageEngine.withAutoCommit
-///     → ProtobufEncoder.encode()
+///     → DatabaseRecordStorageCodec.encode()
 ///     → ItemEnvelope.serialize()
 ///     → transaction.setValue()
 ///     → IndexMaintenanceService.updateIndexes()
 ///   → commit()
 /// ```
 ///
-/// This benchmark isolates each layer to find where time is spent:
+/// This benchmark isolates each responsibility to identify its measured cost:
 ///
 /// ```
-/// Layer 1: Raw KV (ad hoc key, bytes only)                  - minimum raw baseline
-/// Layer 2: Raw KV + framework layout + storage stack        - layout + DataAccess + ItemStorage
-/// Layer 3: Generic DataStore batch path                     - internal generic batch path
-/// Layer 4: Full Framework product path                      - FDBContext.save() fast path
+/// Layer 1: Direct storage mutation                          - storage baseline
+/// Layer 2: Canonical record storage                         - encoding and persisted layout
+/// Layer 3: DataStore batch mutation                         - typed record storage API
+/// Layer 4: Database record mutation                         - application-facing record API
 /// ```
 ///
 /// All layers share the same StorageEngine and connection pool.
 enum ProfileBenchmark {
+    private enum PhaseValidationError: Error {
+        case expectedInlineEnvelope
+        case checksumMismatch
+    }
+
+    // ItemChecksum is intentionally internal to DatabaseEngine. Keep this
+    // benchmark-only table aligned with the canonical CRC32C implementation so
+    // the measured CPU path includes the same checksum work as ItemStorage.
+    private static let crc32cTable: [UInt32] = (0..<256).map { value in
+        var crc = UInt32(value)
+        for _ in 0..<8 {
+            crc = (crc & 1) == 0
+                ? crc >> 1
+                : (crc >> 1) ^ 0x82F6_3B78
+        }
+        return crc
+    }
+
     private final class IterationIDPool: Sendable {
         private let ids: [String]
         private let state: Mutex<Int>
@@ -58,7 +77,7 @@ enum ProfileBenchmark {
 
     private struct ContextRoundState: Sendable {
         let pool: IterationIDPool
-        let context: FDBContext
+        let context: DatabaseContext
     }
 
     private struct DataStoreRoundState: Sendable {
@@ -71,15 +90,16 @@ enum ProfileBenchmark {
     }
 
     private struct DeleteContextRoundState: Sendable {
-        let insertContext: FDBContext
-        let deleteContext: FDBContext
+        let insertContext: DatabaseContext
+        let deleteContext: DatabaseContext
     }
 
     struct BenchmarkStorageLayout: Sendable {
         let itemSubspace: Subspace
         let blobsSubspace: Subspace
+        let itemStorageFactory: ItemStorageFactory
 
-        func frameworkItemKey(id: String) -> [UInt8] {
+        func canonicalItemKey(id: String) -> ByteString {
             itemSubspace.pack(Tuple([id]))
         }
     }
@@ -87,12 +107,12 @@ enum ProfileBenchmark {
     struct PhaseResult: CustomStringConvertible {
         let name: String
         let iterations: Int
-        let totalNanos: UInt64
-        var avgMicros: Double { Double(totalNanos) / Double(iterations) / 1000.0 }
+        let totalNanoseconds: UInt64
+        var averageMicroseconds: Double { Double(totalNanoseconds) / Double(iterations) / 1000.0 }
 
         var description: String {
             let padded = name.padding(toLength: max(40, name.count), withPad: " ", startingAt: 0)
-            return "  \(padded) \(String(format: "%8.1f", avgMicros)) us"
+            return "  \(padded) \(String(format: "%8.1f", averageMicroseconds)) us"
         }
     }
 
@@ -109,38 +129,37 @@ enum ProfileBenchmark {
         print(String(repeating: "=", count: 70))
 
         // Clean state
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
         let layout = try await benchmarkStorageLayout(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
 
         let strategies: [Strategy] = [
-            (BenchmarkLayerContract.writeL1, {
+            (BenchmarkLayerContract.directStorageMutation, {
                 let id = UUID().uuidString
-                try await rawAdHocWrite(engine: engine, id: id)
+                try await adHocStorageWrite(engine: engine, id: id)
             }),
-            (BenchmarkLayerContract.l2, {
+            (BenchmarkLayerContract.canonicalRecordStorage, {
                 let id = UUID().uuidString
-                try await frameworkLayoutStorageWrite(
+                try await canonicalRecordStorageWrite(
                     engine: engine,
                     layout: layout,
-                    id: id,
-                    isNewRecord: true
+                    id: id
                 )
             }),
-            (BenchmarkLayerContract.writeL3, {
+            (BenchmarkLayerContract.dataStoreBatchMutation, {
                 var item = BenchmarkItem()
                 item.name = "Alice"
                 item.age = 30
                 item.score = 85.5
                 try await reusedStore.executeBatch(inserts: [item], deletes: [])
             }),
-            (BenchmarkLayerContract.writeL4, {
+            (BenchmarkLayerContract.databaseRecordMutation, {
                 var item = BenchmarkItem()
                 item.name = "Alice"
                 item.age = 30
                 item.score = 85.5
-                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+                try await DatabaseRecordWorkload.insertOne(container: container, item: item)
             }),
         ]
         let result = try await runner.compareStrategies(
@@ -152,21 +171,21 @@ enum ProfileBenchmark {
             title: "Insert: Layer-by-Layer",
             strategies: strategies
         )
-        printWriteLayerDeltaAnalysis(
+        printWriteWorkloadDeltaAnalysis(
             result,
-            strictBaselineName: BenchmarkLayerContract.writeL1,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            genericPathName: BenchmarkLayerContract.writeL3,
-            productPathName: BenchmarkLayerContract.writeL4
+            directStorageName: BenchmarkLayerContract.directStorageMutation,
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreMutationName: BenchmarkLayerContract.dataStoreBatchMutation,
+            databaseRecordMutationName: BenchmarkLayerContract.databaseRecordMutation
         )
-        printWriteProductTargetAssessment(
-            title: "Insert Product parity summary",
+        printDatabaseRecordMutationTargetAssessment(
+            title: "Insert Database Record Parity Summary",
             result: result,
             fixedMeasurements: fixedMeasurements,
-            productBaselineName: BenchmarkLayerContract.writeL1,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            genericPathName: BenchmarkLayerContract.writeL3,
-            productPathName: BenchmarkLayerContract.writeL4
+            directStorageName: BenchmarkLayerContract.directStorageMutation,
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreMutationName: BenchmarkLayerContract.dataStoreBatchMutation,
+            databaseRecordMutationName: BenchmarkLayerContract.databaseRecordMutation
         )
     }
 
@@ -179,64 +198,67 @@ enum ProfileBenchmark {
         print(String(repeating: "=", count: 70))
 
         let clock = ContinuousClock()
-        let decoder = ProtobufDecoder()
 
-        // Phase 1: Protobuf serialization
+        // Phase 1: canonical DBRC serialization.
         var item = BenchmarkItem()
         item.name = "Alice"
         item.age = 30
         item.score = 85.5
 
-        let protobufEncode = try measurePhase(iterations: iterations, clock: clock) {
-            _ = try DataAccess.serialize(item)
+        let recordEncode = try measurePhase(iterations: iterations, clock: clock) {
+            _ = try DatabaseRecordStorageCodec.encode(item)
         }
 
-        // Phase 2: TransformingSerializer byte path (small values stay uncompressed)
-        let sampleBytes = try DataAccess.serialize(item)
-        let sampleData = Data(sampleBytes)
-        let transformer = TransformingSerializer(configuration: .default)
-        let transformSerialize = try measurePhase(iterations: iterations, clock: clock) {
-            _ = try transformer.serializeSyncBytes(sampleBytes)
-        }
+        let sampleBytes = try DatabaseRecordStorageCodec.encode(item)
 
-        // Phase 3: ItemEnvelope wrapping
-        let envelopeWrap = try measurePhase(iterations: iterations, clock: clock) {
-            let envelope = ItemEnvelope.inline(data: sampleBytes)
+        // Phase 2: checksum and canonical inline envelope serialization.
+        let envelopeEncode = try measurePhase(iterations: iterations, clock: clock) {
+            let checksum = crc32c(sampleBytes)
+            let envelope = try ItemEnvelope.inline(
+                payload: sampleBytes,
+                encoding: .identity,
+                plainByteCount: UInt64(sampleBytes.count),
+                checksum: checksum
+            )
             _ = envelope.serialize()
         }
 
-        // Phase 4: TransformingSerializer reverse path
-        let transformedData = try transformer.serializeSyncBytes(sampleBytes)
-        let transformDeserialize = try measurePhase(iterations: iterations, clock: clock) {
-            _ = try transformer.deserializeSyncBytes(transformedData)
+        let sampleChecksum = crc32c(sampleBytes)
+        let sampleEnvelope = try ItemEnvelope.inline(
+            payload: sampleBytes,
+            encoding: .identity,
+            plainByteCount: UInt64(sampleBytes.count),
+            checksum: sampleChecksum
+        ).serialize()
+
+        // Phase 3: strict envelope parsing, owner-retaining payload view, and
+        // checksum verification. No Data or Array bridge is materialized.
+        let envelopeDecode = try measurePhase(iterations: iterations, clock: clock) {
+            let envelope = try ItemEnvelope.deserialize(sampleEnvelope)
+            guard case .inline(let payload) = envelope.content else {
+                throw PhaseValidationError.expectedInlineEnvelope
+            }
+            guard crc32c(payload) == envelope.checksum else {
+                throw PhaseValidationError.checksumMismatch
+            }
+            _ = payload.count
         }
 
-        // Phase 5: Copied Data bridge used by the old deserialize path.
-        let copiedDataBridge = try measurePhase(iterations: iterations, clock: clock) {
-            _ = Data(sampleBytes)
-        }
-
-        // Phase 6: Decoder-only path (Data already materialized).
-        let protobufDecode = try measurePhase(iterations: iterations, clock: clock) {
-            let decoded: BenchmarkItem = try decoder.decode(BenchmarkItem.self, from: sampleData)
-            _ = decoded.id
-        }
-
-        // Phase 7: Framework deserialize path ([UInt8] bridge + decode + model materialization).
-        let dataAccessDeserialize = try measurePhase(iterations: iterations, clock: clock) {
-            let decoded: BenchmarkItem = try DataAccess.deserialize(sampleBytes)
+        // Phase 4: canonical DBRC decode and model materialization.
+        let recordDecode = try measurePhase(iterations: iterations, clock: clock) {
+            let decoded = try DatabaseRecordStorageCodec.decode(
+                BenchmarkItem.self,
+                from: sampleBytes
+            )
             _ = decoded.id
         }
 
         // Print results
         let results = [
-            PhaseResult(name: "ProtobufEncoder.encode()", iterations: iterations, totalNanos: protobufEncode),
-            PhaseResult(name: "TransformingSerializer.serializeSyncBytes()", iterations: iterations, totalNanos: transformSerialize),
-            PhaseResult(name: "ItemEnvelope.inline + serialize()", iterations: iterations, totalNanos: envelopeWrap),
-            PhaseResult(name: "TransformingSerializer.deserializeSyncBytes()", iterations: iterations, totalNanos: transformDeserialize),
-            PhaseResult(name: "Data(bytes) copy bridge", iterations: iterations, totalNanos: copiedDataBridge),
-            PhaseResult(name: "ProtobufDecoder.decode() (decode + materialize)", iterations: iterations, totalNanos: protobufDecode),
-            PhaseResult(name: "DataAccess.deserialize() ([UInt8] bridge + decode)", iterations: iterations, totalNanos: dataAccessDeserialize),
+            PhaseResult(name: "DBRC encode", iterations: iterations, totalNanoseconds: recordEncode),
+            PhaseResult(name: "CRC32C + inline envelope encode", iterations: iterations, totalNanoseconds: envelopeEncode),
+            PhaseResult(name: "Envelope decode/view + CRC32C", iterations: iterations, totalNanoseconds: envelopeDecode),
+            PhaseResult(name: "DBRC decode + materialize", iterations: iterations, totalNanoseconds: recordDecode),
         ]
 
         print("")
@@ -246,6 +268,17 @@ enum ProfileBenchmark {
             print(r)
         }
         print("")
+    }
+
+    private static func crc32c(_ bytes: ByteString) -> UInt32 {
+        bytes.withUnsafeBytes { source in
+            var crc = UInt32.max
+            for byte in source {
+                let index = Int(UInt8(truncatingIfNeeded: crc) ^ byte)
+                crc = crc32cTable[index] ^ (crc >> 8)
+            }
+            return ~crc
+        }
     }
 
     // MARK: - Read Path Profile
@@ -261,42 +294,41 @@ enum ProfileBenchmark {
         print(String(repeating: "=", count: 70))
 
         // Seed data
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
-        let fwID = "read-profile-fw"
-        let kvID = "read-profile-kv"
+        let databaseRecordID = "read-profile-database-record"
+        let canonicalStorageID = "read-profile-canonical-storage"
         let layout = try await benchmarkStorageLayout(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
 
-        // Seed framework
-        var fwItem = BenchmarkItem()
-        fwItem.id = fwID
-        fwItem.name = "Alice"
-        fwItem.age = 30
-        fwItem.score = 85.5
-        try await FrameworkPostgreSQL.insertOne(container: container, item: fwItem)
+        // Seed the application-facing record API.
+        var databaseRecordItem = BenchmarkItem()
+        databaseRecordItem.id = databaseRecordID
+        databaseRecordItem.name = "Alice"
+        databaseRecordItem.age = 30
+        databaseRecordItem.score = 85.5
+        try await DatabaseRecordWorkload.insertOne(container: container, item: databaseRecordItem)
 
-        // Seed KV with the same serialization stack as the framework.
-        try await frameworkLayoutStorageWrite(
+        // Seed the canonical record storage representation.
+        try await canonicalRecordStorageWrite(
             engine: engine,
             layout: layout,
-            id: kvID,
-            isNewRecord: true
+            id: canonicalStorageID
         )
 
         let strategies: [Strategy] = [
-            (BenchmarkLayerContract.readL1, {
-                try await rawFrameworkKeyRead(engine: engine, layout: layout, id: kvID)
+            (BenchmarkLayerContract.canonicalKeyPresenceRead, {
+                try await canonicalKeyStorageRead(engine: engine, layout: layout, id: canonicalStorageID)
             }),
-            (BenchmarkLayerContract.l2, {
-                _ = try await frameworkLayoutStorageDecodedRead(engine: engine, layout: layout, id: kvID)
+            (BenchmarkLayerContract.canonicalRecordStorage, {
+                _ = try await canonicalRecordStorageRead(engine: engine, layout: layout, id: canonicalStorageID)
             }),
-            (BenchmarkLayerContract.readDataStoreParity, {
-                _ = try await reusedStore.fetch(BenchmarkItem.self, id: fwID)
+            (BenchmarkLayerContract.dataStoreRecordRead, {
+                _ = try await reusedStore.fetch(BenchmarkItem.self, id: databaseRecordID)
             }),
-            (BenchmarkLayerContract.fullFramework, {
-                _ = try await FrameworkPostgreSQL.readOne(container: container, id: fwID)
+            (BenchmarkLayerContract.databaseRecordQueryAPI, {
+                _ = try await DatabaseRecordWorkload.readOne(container: container, id: databaseRecordID)
             }),
         ]
         let result = try await runner.compareStrategies(
@@ -312,20 +344,20 @@ enum ProfileBenchmark {
         )
         printStorageAndContextDeltaAnalysis(
             result,
-            strictBaselineName: BenchmarkLayerContract.readL1,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.readDataStoreParity,
-            contextName: BenchmarkLayerContract.fullFramework,
-            storageDescription: BenchmarkLayerContract.readL2ToL3Description,
-            contextDescription: BenchmarkLayerContract.readL3ToL4Description
+            directStorageName: BenchmarkLayerContract.canonicalKeyPresenceRead,
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreName: BenchmarkLayerContract.dataStoreRecordRead,
+            contextName: BenchmarkLayerContract.databaseRecordQueryAPI,
+            storageDescription: BenchmarkLayerContract.dataStoreReadTransitionDescription,
+            contextDescription: BenchmarkLayerContract.contextReadTransitionDescription
         )
         printParityTargetAssessment(
             title: "Point Read Parity Summary",
             result: result,
             fixedMeasurements: fixedMeasurements,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.readDataStoreParity,
-            contextName: BenchmarkLayerContract.fullFramework
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreName: BenchmarkLayerContract.dataStoreRecordRead,
+            contextName: BenchmarkLayerContract.databaseRecordQueryAPI
         )
     }
 
@@ -341,8 +373,8 @@ enum ProfileBenchmark {
         print("PROFILE: Read Path Lifecycle Overhead")
         print(String(repeating: "=", count: 70))
 
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
         let readID = "read-lifecycle"
         var item = BenchmarkItem()
@@ -350,15 +382,15 @@ enum ProfileBenchmark {
         item.name = "Alice"
         item.age = 30
         item.score = 85.5
-        try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+        try await DatabaseRecordWorkload.insertOne(container: container, item: item)
 
         let layout = try await benchmarkStorageLayout(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
-        let reusedContext = FDBContext(container: container)
+        let reusedContext = DatabaseContext(container: container)
 
         let strategies: [Strategy] = [
-            (BenchmarkLayerContract.l2, {
-                _ = try await frameworkLayoutStorageDecodedRead(engine: engine, layout: layout, id: readID)
+            (BenchmarkLayerContract.canonicalRecordStorage, {
+                _ = try await canonicalRecordStorageRead(engine: engine, layout: layout, id: readID)
             }),
             ("DataStore.fetchById + autoCommit parity", {
                 _ = try await reusedStore.withAutoCommit { transaction in
@@ -369,7 +401,7 @@ enum ProfileBenchmark {
                     )
                 }
             }),
-            (BenchmarkLayerContract.readDataStoreParity, {
+            (BenchmarkLayerContract.dataStoreRecordRead, {
                 _ = try await reusedStore.fetch(BenchmarkItem.self, id: readID)
             }),
             ("Fresh DataStore.fetchById + autoCommit parity", {
@@ -382,11 +414,16 @@ enum ProfileBenchmark {
                     )
                 }
             }),
-            (BenchmarkLayerContract.reusedContextParity, {
-                _ = try await reusedContext.model(for: readID, as: BenchmarkItem.self)
+            (BenchmarkLayerContract.reusedContextRecordRead, {
+                _ = try await reusedContext.withTransaction { transaction in
+                    try await transaction.fetch(
+                        BenchmarkItem.self,
+                        identifiedBy: readID
+                    )
+                }
             }),
-            (BenchmarkLayerContract.freshContextParity, {
-                _ = try await FrameworkPostgreSQL.readOne(container: container, id: readID)
+            (BenchmarkLayerContract.freshContextRecordRead, {
+                _ = try await DatabaseRecordWorkload.readOne(container: container, id: readID)
             }),
         ]
         let result = try await runner.compareStrategies(
@@ -402,9 +439,9 @@ enum ProfileBenchmark {
         )
         printStorageAndContextDeltaAnalysis(
             result,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.readDataStoreParity,
-            contextName: BenchmarkLayerContract.freshContextParity
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreName: BenchmarkLayerContract.dataStoreRecordRead,
+            contextName: BenchmarkLayerContract.freshContextRecordRead
         )
     }
 
@@ -420,8 +457,8 @@ enum ProfileBenchmark {
         print("PROFILE: Read Hot Path Fixed Iteration (\(iterations) iterations)")
         print(String(repeating: "=", count: 70))
 
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
         let readID = "read-fixed"
         var item = BenchmarkItem()
@@ -429,21 +466,21 @@ enum ProfileBenchmark {
         item.name = "Alice"
         item.age = 30
         item.score = 85.5
-        try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+        try await DatabaseRecordWorkload.insertOne(container: container, item: item)
 
         let layout = try await benchmarkStorageLayout(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
-        let reusedContext = FDBContext(container: container)
+        let reusedContext = DatabaseContext(container: container)
         let clock = ContinuousClock()
 
         let contextInit = try measurePhase(iterations: iterations, clock: clock) {
-            _ = FDBContext(container: container)
+            _ = DatabaseContext(container: container)
         }
         let storeInit = try await measureAsyncPhase(iterations: iterations) {
             _ = try await container.store(for: BenchmarkItem.self)
         }
-        let rawDecode = try await measureAsyncPhase(iterations: iterations) {
-            _ = try await frameworkLayoutStorageDecodedRead(engine: engine, layout: layout, id: readID)
+        let canonicalStorageDecode = try await measureAsyncPhase(iterations: iterations) {
+            _ = try await canonicalRecordStorageRead(engine: engine, layout: layout, id: readID)
         }
         let dataStoreAutoCommit = try await measureAsyncPhase(iterations: iterations) {
             _ = try await reusedStore.withAutoCommit { transaction in
@@ -458,20 +495,25 @@ enum ProfileBenchmark {
             _ = try await reusedStore.fetch(BenchmarkItem.self, id: readID)
         }
         let reusedContextRead = try await measureAsyncPhase(iterations: iterations) {
-            _ = try await reusedContext.model(for: readID, as: BenchmarkItem.self)
+            _ = try await reusedContext.withTransaction { transaction in
+                try await transaction.fetch(
+                    BenchmarkItem.self,
+                    identifiedBy: readID
+                )
+            }
         }
         let freshContextRead = try await measureAsyncPhase(iterations: iterations) {
-            _ = try await FrameworkPostgreSQL.readOne(container: container, id: readID)
+            _ = try await DatabaseRecordWorkload.readOne(container: container, id: readID)
         }
 
         let results = [
-            PhaseResult(name: "FDBContext.init()", iterations: iterations, totalNanos: contextInit),
-            PhaseResult(name: "DBContainer.store(for:)", iterations: iterations, totalNanos: storeInit),
-            PhaseResult(name: "Raw KV + framework layout + storage stack", iterations: iterations, totalNanos: rawDecode),
-            PhaseResult(name: "DataStore.fetchById + autoCommit", iterations: iterations, totalNanos: dataStoreAutoCommit),
-            PhaseResult(name: "DataStore.fetch()", iterations: iterations, totalNanos: dataStoreFetch),
-            PhaseResult(name: "FDBContext.model() reused context", iterations: iterations, totalNanos: reusedContextRead),
-            PhaseResult(name: "FDBContext.model() fresh context", iterations: iterations, totalNanos: freshContextRead),
+            PhaseResult(name: "DatabaseContext.init()", iterations: iterations, totalNanoseconds: contextInit),
+            PhaseResult(name: "DBContainer.store(for:)", iterations: iterations, totalNanoseconds: storeInit),
+            PhaseResult(name: "Canonical record storage", iterations: iterations, totalNanoseconds: canonicalStorageDecode),
+            PhaseResult(name: "DataStore.fetchById + autoCommit", iterations: iterations, totalNanoseconds: dataStoreAutoCommit),
+            PhaseResult(name: "DataStore.fetch()", iterations: iterations, totalNanoseconds: dataStoreFetch),
+            PhaseResult(name: "DatabaseContext.fetch() reused context", iterations: iterations, totalNanoseconds: reusedContextRead),
+            PhaseResult(name: "DatabaseContext.fetch() fresh context", iterations: iterations, totalNanoseconds: freshContextRead),
         ]
 
         print("")
@@ -486,12 +528,12 @@ enum ProfileBenchmark {
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
             name: "fetch() - fetchById+autoCommit",
-            deltaNanos: Int64(dataStoreFetch) - Int64(dataStoreAutoCommit),
+            deltaNanoseconds: Int64(dataStoreFetch) - Int64(dataStoreAutoCommit),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh context - reused context",
-            deltaNanos: Int64(freshContextRead) - Int64(reusedContextRead),
+            deltaNanoseconds: Int64(freshContextRead) - Int64(reusedContextRead),
             iterations: iterations
         )
         print("")
@@ -512,27 +554,25 @@ enum ProfileBenchmark {
         let reusedStore = try await container.store(for: BenchmarkItem.self)
 
         let strategies: [Strategy] = [
-            (BenchmarkLayerContract.writeL1, {
+            (BenchmarkLayerContract.directStorageMutation, {
                 let id = UUID().uuidString
-                try await rawAdHocWrite(engine: engine, id: id)
-                try await rawAdHocDelete(engine: engine, id: id)
+                try await adHocStorageWrite(engine: engine, id: id)
+                try await adHocStorageDelete(engine: engine, id: id)
             }),
-            (BenchmarkLayerContract.l2, {
+            (BenchmarkLayerContract.canonicalRecordStorage, {
                 let id = UUID().uuidString
-                try await frameworkLayoutStorageWrite(
+                try await canonicalRecordStorageWrite(
                     engine: engine,
                     layout: layout,
-                    id: id,
-                    isNewRecord: true
+                    id: id
                 )
-                try await frameworkLayoutStorageDelete(
+                try await canonicalRecordStorageDelete(
                     engine: engine,
                     layout: layout,
-                    id: id,
-                    skipBlobCleanup: true
+                    id: id
                 )
             }),
-            (BenchmarkLayerContract.writeL3, {
+            (BenchmarkLayerContract.dataStoreBatchMutation, {
                 var item = BenchmarkItem()
                 item.id = UUID().uuidString
                 item.name = "Temp"
@@ -541,15 +581,15 @@ enum ProfileBenchmark {
                 try await reusedStore.executeBatch(inserts: [item], deletes: [])
                 try await reusedStore.executeBatch(inserts: [], deletes: [item])
             }),
-            (BenchmarkLayerContract.writeL4, {
+            (BenchmarkLayerContract.databaseRecordMutation, {
                 let id = UUID().uuidString
                 var item = BenchmarkItem()
                 item.id = id
                 item.name = "Temp"
                 item.age = 30
                 item.score = 50.0
-                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
-                try await FrameworkPostgreSQL.deleteOne(container: container, id: id)
+                try await DatabaseRecordWorkload.insertOne(container: container, item: item)
+                try await DatabaseRecordWorkload.deleteOne(container: container, id: id)
             }),
         ]
         let result = try await runner.compareStrategies(
@@ -557,7 +597,7 @@ enum ProfileBenchmark {
             strategies: strategies
         )
         ConsoleReporter.print(result)
-        let fixedMeasurements = try await measureDeletePathFixedSummaries(
+        let fixedMeasurements = try await measureDeleteWorkloadFixedSummaries(
             engine: engine,
             container: container,
             iterations: 200,
@@ -571,62 +611,60 @@ enum ProfileBenchmark {
         )
         printStorageAndContextDeltaAnalysis(
             result,
-            strictBaselineName: BenchmarkLayerContract.writeL1,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.writeL3,
-            contextName: BenchmarkLayerContract.writeL4,
-            storageDescription: BenchmarkLayerContract.writeL2ToL3Description,
-            contextDescription: BenchmarkLayerContract.writeL3ToL4Description
+            directStorageName: BenchmarkLayerContract.directStorageMutation,
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreName: BenchmarkLayerContract.dataStoreBatchMutation,
+            contextName: BenchmarkLayerContract.databaseRecordMutation,
+            storageDescription: BenchmarkLayerContract.dataStoreBatchTransitionDescription,
+            contextDescription: BenchmarkLayerContract.databaseRecordMutationTransitionDescription
         )
-        printWriteProductTargetAssessment(
-            title: "Insert+Delete Product parity summary",
+        printDatabaseRecordMutationTargetAssessment(
+            title: "Insert+Delete Database Record Parity Summary",
             result: result,
             fixedMeasurements: fixedMeasurements,
-            productBaselineName: BenchmarkLayerContract.writeL1,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            genericPathName: BenchmarkLayerContract.writeL3,
-            productPathName: BenchmarkLayerContract.writeL4
+            directStorageName: BenchmarkLayerContract.directStorageMutation,
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreMutationName: BenchmarkLayerContract.dataStoreBatchMutation,
+            databaseRecordMutationName: BenchmarkLayerContract.databaseRecordMutation
         )
     }
 
-    private static func measureDeletePathFixedSummaries(
+    private static func measureDeleteWorkloadFixedSummaries(
         engine: any StorageEngine,
         container: DBContainer,
         iterations: Int,
         rounds: Int
     ) async throws -> [FixedIterationReporter.MeasurementSummary] {
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
         let layout = try await benchmarkStorageLayout(container: container)
 
-        let rawInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+        let adHocStorageInsertDelete = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
             operation: { _ in
                 let id = UUID().uuidString
-                try await rawAdHocWrite(engine: engine, id: id)
-                try await rawAdHocDelete(engine: engine, id: id)
+                try await adHocStorageWrite(engine: engine, id: id)
+                try await adHocStorageDelete(engine: engine, id: id)
             }
         )
-        let layoutInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+        let canonicalRecordInsertDelete = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
             operation: { _ in
                 let id = UUID().uuidString
-                try await frameworkLayoutStorageWrite(
+                try await canonicalRecordStorageWrite(
                     engine: engine,
                     layout: layout,
-                    id: id,
-                    isNewRecord: true
+                    id: id
                 )
-                try await frameworkLayoutStorageDelete(
+                try await canonicalRecordStorageDelete(
                     engine: engine,
                     layout: layout,
-                    id: id,
-                    skipBlobCleanup: true
+                    id: id
                 )
             }
         )
@@ -634,7 +672,7 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 let store = try await container.store(for: BenchmarkItem.self)
                 return DataStoreRoundState(store: store)
             },
@@ -648,14 +686,14 @@ enum ProfileBenchmark {
                 try await state.store.executeBatch(inserts: [], deletes: [item])
             }
         )
-        let productInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+        let databaseRecordInsertDelete = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 return DeleteContextRoundState(
-                    insertContext: FDBContext(container: container),
-                    deleteContext: FDBContext(container: container)
+                    insertContext: DatabaseContext(container: container),
+                    deleteContext: DatabaseContext(container: container)
                 )
             },
             operation: { state in
@@ -672,10 +710,10 @@ enum ProfileBenchmark {
         )
 
         return [
-            .init(name: BenchmarkLayerContract.writeL1, totalNanos: rawInsertDelete / UInt64(iterations)),
-            .init(name: BenchmarkLayerContract.l2, totalNanos: layoutInsertDelete / UInt64(iterations)),
-            .init(name: BenchmarkLayerContract.writeL3, totalNanos: dataStoreInsertDelete / UInt64(iterations)),
-            .init(name: BenchmarkLayerContract.writeL4, totalNanos: productInsertDelete / UInt64(iterations)),
+            .init(name: BenchmarkLayerContract.directStorageMutation, totalNanoseconds: adHocStorageInsertDelete / UInt64(iterations)),
+            .init(name: BenchmarkLayerContract.canonicalRecordStorage, totalNanoseconds: canonicalRecordInsertDelete / UInt64(iterations)),
+            .init(name: BenchmarkLayerContract.dataStoreBatchMutation, totalNanoseconds: dataStoreInsertDelete / UInt64(iterations)),
+            .init(name: BenchmarkLayerContract.databaseRecordMutation, totalNanoseconds: databaseRecordInsertDelete / UInt64(iterations)),
         ]
     }
 
@@ -691,10 +729,10 @@ enum ProfileBenchmark {
         print("PROFILE: Delete Path Lifecycle Overhead (\(iterations) iterations, median of \(rounds) rounds)")
         print(String(repeating: "=", count: 70))
 
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
-        let reusedInsertContext = FDBContext(container: container)
-        let reusedDeleteContext = FDBContext(container: container)
+        let reusedInsertContext = DatabaseContext(container: container)
+        let reusedDeleteContext = DatabaseContext(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
         let clock = ContinuousClock()
         let seedCount = max(1024, iterations + 32)
@@ -702,7 +740,7 @@ enum ProfileBenchmark {
         var deleteSetupCounter = 0
 
         let contextInit = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            _ = FDBContext(container: container)
+            _ = DatabaseContext(container: container)
         }
         let reusedInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
             var item = BenchmarkItem()
@@ -715,7 +753,7 @@ enum ProfileBenchmark {
             reusedInsertContext.rollback()
         }
         let freshInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            let context = FDBContext(container: container)
+            let context = DatabaseContext(container: container)
             var item = BenchmarkItem()
             item.id = "delete-life-insert-fresh-\(insertSetupCounter)"
             item.name = "Temp"
@@ -736,7 +774,7 @@ enum ProfileBenchmark {
             reusedDeleteContext.rollback()
         }
         let freshDeleteRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            let context = FDBContext(container: container)
+            let context = DatabaseContext(container: container)
             var item = BenchmarkItem()
             item.id = "delete-life-delete-fresh-\(deleteSetupCounter)"
             item.name = "Temp"
@@ -750,10 +788,10 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 return ContextRoundState(
                     pool: IterationIDPool(ids: []),
-                    context: FDBContext(container: container)
+                    context: DatabaseContext(container: container)
                 )
             },
             operation: { state in
@@ -770,7 +808,7 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 return DataStoreRoundState(store: reusedStore)
             },
             operation: { state in
@@ -786,7 +824,7 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 return PoolRoundState(pool: IterationIDPool(ids: []))
             },
             operation: { _ in
@@ -803,7 +841,7 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 return PoolRoundState(pool: IterationIDPool(ids: []))
             },
             operation: { _ in
@@ -812,22 +850,22 @@ enum ProfileBenchmark {
                 item.name = "Temp"
                 item.age = 30
                 item.score = 50.0
-                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
+                try await DatabaseRecordWorkload.insertOne(container: container, item: item)
             }
         )
         let reusedDeleteSave = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "delete-life-reused-r\(round)"
                 )
                 return ContextRoundState(
                     pool: IterationIDPool(ids: ids),
-                    context: FDBContext(container: container)
+                    context: DatabaseContext(container: container)
                 )
             },
             operation: { state in
@@ -844,8 +882,8 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "delete-life-store-reused-r\(round)"
@@ -868,8 +906,8 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "delete-life-store-lookup-r\(round)"
@@ -890,8 +928,8 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "delete-life-fresh-r\(round)"
@@ -899,24 +937,24 @@ enum ProfileBenchmark {
                 return PoolRoundState(pool: IterationIDPool(ids: ids))
             },
             operation: { state in
-                try await FrameworkPostgreSQL.deleteOne(container: container, id: state.pool.next())
+                try await DatabaseRecordWorkload.deleteOne(container: container, id: state.pool.next())
             }
         )
 
         let results = [
-            PhaseResult(name: "FDBContext.init()", iterations: iterations, totalNanos: contextInit),
-            PhaseResult(name: "FDBContext.insert()+rollback() reused", iterations: iterations, totalNanos: reusedInsertRollback),
-            PhaseResult(name: "FDBContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanos: freshInsertRollback),
-            PhaseResult(name: "FDBContext.delete()+rollback() reused", iterations: iterations, totalNanos: reusedDeleteRollback),
-            PhaseResult(name: "FDBContext.init()+delete()+rollback() fresh", iterations: iterations, totalNanos: freshDeleteRollback),
-            PhaseResult(name: "DataStore.executeBatch() insert reused store", iterations: iterations, totalNanos: reusedStoreInsert),
-            PhaseResult(name: "DataStore.executeBatch() insert with store lookup", iterations: iterations, totalNanos: lookupStoreInsert),
-            PhaseResult(name: "FDBContext.save() insert reused", iterations: iterations, totalNanos: reusedInsertSave),
-            PhaseResult(name: "FDBContext.save() insert fresh", iterations: iterations, totalNanos: freshInsertSave),
-            PhaseResult(name: "DataStore.executeBatch() delete reused store", iterations: iterations, totalNanos: reusedStoreDelete),
-            PhaseResult(name: "DataStore.executeBatch() delete with store lookup", iterations: iterations, totalNanos: lookupStoreDelete),
-            PhaseResult(name: "FDBContext.save() delete reused", iterations: iterations, totalNanos: reusedDeleteSave),
-            PhaseResult(name: "FDBContext.save() delete fresh", iterations: iterations, totalNanos: freshDeleteSave),
+            PhaseResult(name: "DatabaseContext.init()", iterations: iterations, totalNanoseconds: contextInit),
+            PhaseResult(name: "DatabaseContext.insert()+rollback() reused", iterations: iterations, totalNanoseconds: reusedInsertRollback),
+            PhaseResult(name: "DatabaseContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanoseconds: freshInsertRollback),
+            PhaseResult(name: "DatabaseContext.delete()+rollback() reused", iterations: iterations, totalNanoseconds: reusedDeleteRollback),
+            PhaseResult(name: "DatabaseContext.init()+delete()+rollback() fresh", iterations: iterations, totalNanoseconds: freshDeleteRollback),
+            PhaseResult(name: "DataStore.executeBatch() insert reused store", iterations: iterations, totalNanoseconds: reusedStoreInsert),
+            PhaseResult(name: "DataStore.executeBatch() insert with store lookup", iterations: iterations, totalNanoseconds: lookupStoreInsert),
+            PhaseResult(name: "DatabaseContext.save() insert reused", iterations: iterations, totalNanoseconds: reusedInsertSave),
+            PhaseResult(name: "DatabaseContext.save() insert fresh", iterations: iterations, totalNanoseconds: freshInsertSave),
+            PhaseResult(name: "DataStore.executeBatch() delete reused store", iterations: iterations, totalNanoseconds: reusedStoreDelete),
+            PhaseResult(name: "DataStore.executeBatch() delete with store lookup", iterations: iterations, totalNanoseconds: lookupStoreDelete),
+            PhaseResult(name: "DatabaseContext.save() delete reused", iterations: iterations, totalNanoseconds: reusedDeleteSave),
+            PhaseResult(name: "DatabaseContext.save() delete fresh", iterations: iterations, totalNanoseconds: freshDeleteSave),
         ]
 
         print("")
@@ -931,42 +969,42 @@ enum ProfileBenchmark {
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
             name: "fresh insert setup - reused",
-            deltaNanos: Int64(freshInsertRollback) - Int64(reusedInsertRollback),
+            deltaNanoseconds: Int64(freshInsertRollback) - Int64(reusedInsertRollback),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh delete setup - reused",
-            deltaNanos: Int64(freshDeleteRollback) - Int64(reusedDeleteRollback),
+            deltaNanoseconds: Int64(freshDeleteRollback) - Int64(reusedDeleteRollback),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh insert save - reused",
-            deltaNanos: Int64(freshInsertSave) - Int64(reusedInsertSave),
+            deltaNanoseconds: Int64(freshInsertSave) - Int64(reusedInsertSave),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh delete save - reused",
-            deltaNanos: Int64(freshDeleteSave) - Int64(reusedDeleteSave),
+            deltaNanoseconds: Int64(freshDeleteSave) - Int64(reusedDeleteSave),
             iterations: iterations
         )
         printSignedDelta(
             name: "store lookup insert - reused store",
-            deltaNanos: Int64(lookupStoreInsert) - Int64(reusedStoreInsert),
+            deltaNanoseconds: Int64(lookupStoreInsert) - Int64(reusedStoreInsert),
             iterations: iterations
         )
         printSignedDelta(
             name: "store lookup delete - reused store",
-            deltaNanos: Int64(lookupStoreDelete) - Int64(reusedStoreDelete),
+            deltaNanoseconds: Int64(lookupStoreDelete) - Int64(reusedStoreDelete),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh insert save - store lookup insert",
-            deltaNanos: Int64(freshInsertSave) - Int64(lookupStoreInsert),
+            deltaNanoseconds: Int64(freshInsertSave) - Int64(lookupStoreInsert),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh delete save - store lookup delete",
-            deltaNanos: Int64(freshDeleteSave) - Int64(lookupStoreDelete),
+            deltaNanoseconds: Int64(freshDeleteSave) - Int64(lookupStoreDelete),
             iterations: iterations
         )
         print("")
@@ -983,38 +1021,36 @@ enum ProfileBenchmark {
         print("PROFILE: Insert+Delete Hot Path Fixed Iteration (\(iterations) iterations, median of \(rounds) rounds)")
         print(String(repeating: "=", count: 70))
 
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
         let layout = try await benchmarkStorageLayout(container: container)
-        let rawInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+        let adHocStorageInsertDelete = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
             operation: { _ in
                 let id = UUID().uuidString
-                try await rawAdHocWrite(engine: engine, id: id)
-                try await rawAdHocDelete(engine: engine, id: id)
+                try await adHocStorageWrite(engine: engine, id: id)
+                try await adHocStorageDelete(engine: engine, id: id)
             }
         )
 
-        let layoutInsertDelete = try await measureAsyncPhaseMedianWithSetup(
+        let canonicalRecordInsertDelete = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { _ in PoolRoundState(pool: IterationIDPool(ids: [])) },
             operation: { _ in
                 let id = UUID().uuidString
-                try await frameworkLayoutStorageWrite(
+                try await canonicalRecordStorageWrite(
                     engine: engine,
                     layout: layout,
-                    id: id,
-                    isNewRecord: true
+                    id: id
                 )
-                try await frameworkLayoutStorageDelete(
+                try await canonicalRecordStorageDelete(
                     engine: engine,
                     layout: layout,
-                    id: id,
-                    skipBlobCleanup: true
+                    id: id
                 )
             }
         )
@@ -1023,7 +1059,7 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 let store = try await container.store(for: BenchmarkItem.self)
                 return DataStoreRoundState(store: store)
             },
@@ -1042,10 +1078,10 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 return DeleteContextRoundState(
-                    insertContext: FDBContext(container: container),
-                    deleteContext: FDBContext(container: container)
+                    insertContext: DatabaseContext(container: container),
+                    deleteContext: DatabaseContext(container: container)
                 )
             },
             operation: { state in
@@ -1065,7 +1101,7 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { _ in
-                try await FrameworkPostgreSQL.cleanup(container: container)
+                try await DatabaseRecordWorkload.cleanup(container: container)
                 return PoolRoundState(pool: IterationIDPool(ids: []))
             },
             operation: { _ in
@@ -1075,17 +1111,17 @@ enum ProfileBenchmark {
                 item.name = "Temp"
                 item.age = 30
                 item.score = 50.0
-                try await FrameworkPostgreSQL.insertOne(container: container, item: item)
-                try await FrameworkPostgreSQL.deleteOne(container: container, id: id)
+                try await DatabaseRecordWorkload.insertOne(container: container, item: item)
+                try await DatabaseRecordWorkload.deleteOne(container: container, id: id)
             }
         )
 
         let results = [
-            PhaseResult(name: "Raw KV insert+delete", iterations: iterations, totalNanos: rawInsertDelete),
-            PhaseResult(name: "Framework layout + storage insert+delete", iterations: iterations, totalNanos: layoutInsertDelete),
-            PhaseResult(name: "Generic DataStore batch path insert+delete", iterations: iterations, totalNanos: dataStoreInsertDelete),
-            PhaseResult(name: "FDBContext.save() reused contexts", iterations: iterations, totalNanos: reusedContextInsertDelete),
-            PhaseResult(name: "FDBContext.save() fresh contexts", iterations: iterations, totalNanos: freshContextInsertDelete),
+            PhaseResult(name: "Direct storage insert+delete", iterations: iterations, totalNanoseconds: adHocStorageInsertDelete),
+            PhaseResult(name: "Canonical record storage insert+delete", iterations: iterations, totalNanoseconds: canonicalRecordInsertDelete),
+            PhaseResult(name: "DataStore batch mutation insert+delete", iterations: iterations, totalNanoseconds: dataStoreInsertDelete),
+            PhaseResult(name: "DatabaseContext.save() reused contexts", iterations: iterations, totalNanoseconds: reusedContextInsertDelete),
+            PhaseResult(name: "DatabaseContext.save() fresh contexts", iterations: iterations, totalNanoseconds: freshContextInsertDelete),
         ]
 
         print("")
@@ -1099,18 +1135,18 @@ enum ProfileBenchmark {
         print("  Inferred overheads")
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
-            name: "generic-vs-layout insert+delete",
-            deltaNanos: Int64(dataStoreInsertDelete) - Int64(layoutInsertDelete),
+            name: "data-store-vs-canonical-storage insert+delete",
+            deltaNanoseconds: Int64(dataStoreInsertDelete) - Int64(canonicalRecordInsertDelete),
             iterations: iterations
         )
         printSignedDelta(
-            name: "product-vs-generic insert+delete",
-            deltaNanos: Int64(reusedContextInsertDelete) - Int64(dataStoreInsertDelete),
+            name: "database-record-vs-data-store insert+delete",
+            deltaNanoseconds: Int64(reusedContextInsertDelete) - Int64(dataStoreInsertDelete),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh-vs-reused insert+delete",
-            deltaNanos: Int64(freshContextInsertDelete) - Int64(reusedContextInsertDelete),
+            deltaNanoseconds: Int64(freshContextInsertDelete) - Int64(reusedContextInsertDelete),
             iterations: iterations
         )
         print("")
@@ -1128,52 +1164,50 @@ enum ProfileBenchmark {
         print("PROFILE: Update Path Layer-by-Layer")
         print(String(repeating: "=", count: 70))
 
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
-        let kvID = "update-profile-kv"
-        let fwID = "update-profile-fw"
+        let canonicalStorageID = "update-profile-canonical-storage"
+        let databaseRecordID = "update-profile-database-record"
         let layout = try await benchmarkStorageLayout(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
 
-        try await frameworkLayoutStorageWrite(
+        try await canonicalRecordStorageWrite(
             engine: engine,
             layout: layout,
-            id: kvID,
-            isNewRecord: true
+            id: canonicalStorageID
         )
 
-        var fwItem = BenchmarkItem()
-        fwItem.id = fwID
-        fwItem.name = "Alice"
-        fwItem.age = 30
-        fwItem.score = 85.5
-        try await FrameworkPostgreSQL.insertOne(container: container, item: fwItem)
+        var databaseRecordItem = BenchmarkItem()
+        databaseRecordItem.id = databaseRecordID
+        databaseRecordItem.name = "Alice"
+        databaseRecordItem.age = 30
+        databaseRecordItem.score = 85.5
+        try await DatabaseRecordWorkload.insertOne(container: container, item: databaseRecordItem)
 
         var updated = BenchmarkItem()
-        updated.id = fwID
+        updated.id = databaseRecordID
         updated.name = "Updated Stable"
         updated.age = 42
         updated.score = 91.25
         let updatedItem = updated
 
         let strategies: [Strategy] = [
-            (BenchmarkLayerContract.writeL1, {
-                try await rawAdHocWrite(engine: engine, id: kvID)
+            (BenchmarkLayerContract.directStorageMutation, {
+                try await adHocStorageWrite(engine: engine, id: canonicalStorageID)
             }),
-            (BenchmarkLayerContract.l2, {
-                try await frameworkLayoutStorageWrite(
+            (BenchmarkLayerContract.canonicalRecordStorage, {
+                try await canonicalRecordStorageWrite(
                     engine: engine,
                     layout: layout,
-                    id: kvID,
-                    isNewRecord: false
+                    id: canonicalStorageID
                 )
             }),
-            (BenchmarkLayerContract.writeL3, {
+            (BenchmarkLayerContract.dataStoreBatchMutation, {
                 try await reusedStore.executeBatch(inserts: [updatedItem], deletes: [])
             }),
-            (BenchmarkLayerContract.writeL4, {
-                try await FrameworkPostgreSQL.updateOne(container: container, item: updatedItem)
+            (BenchmarkLayerContract.databaseRecordMutation, {
+                try await DatabaseRecordWorkload.updateOne(container: container, item: updatedItem)
             }),
         ]
         let result = try await runner.compareStrategies(
@@ -1181,7 +1215,7 @@ enum ProfileBenchmark {
             strategies: strategies
         )
         ConsoleReporter.print(result)
-        let fixedMeasurements = try await measureUpdatePathFixedSummaries(
+        let fixedMeasurements = try await measureUpdateWorkloadFixedSummaries(
             engine: engine,
             container: container,
             iterations: 200,
@@ -1195,72 +1229,71 @@ enum ProfileBenchmark {
         )
         printStorageAndContextDeltaAnalysis(
             result,
-            strictBaselineName: BenchmarkLayerContract.writeL1,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            dataStoreName: BenchmarkLayerContract.writeL3,
-            contextName: BenchmarkLayerContract.writeL4,
-            storageDescription: BenchmarkLayerContract.writeL2ToL3Description,
-            contextDescription: BenchmarkLayerContract.writeL3ToL4Description
+            directStorageName: BenchmarkLayerContract.directStorageMutation,
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreName: BenchmarkLayerContract.dataStoreBatchMutation,
+            contextName: BenchmarkLayerContract.databaseRecordMutation,
+            storageDescription: BenchmarkLayerContract.dataStoreBatchTransitionDescription,
+            contextDescription: BenchmarkLayerContract.databaseRecordMutationTransitionDescription
         )
-        printWriteProductTargetAssessment(
-            title: "Point Update Product parity summary",
+        printDatabaseRecordMutationTargetAssessment(
+            title: "Point Update Database Record Parity Summary",
             result: result,
             fixedMeasurements: fixedMeasurements,
-            productBaselineName: BenchmarkLayerContract.writeL1,
-            storageBaselineName: BenchmarkLayerContract.l2,
-            genericPathName: BenchmarkLayerContract.writeL3,
-            productPathName: BenchmarkLayerContract.writeL4
+            directStorageName: BenchmarkLayerContract.directStorageMutation,
+            canonicalStorageName: BenchmarkLayerContract.canonicalRecordStorage,
+            dataStoreMutationName: BenchmarkLayerContract.dataStoreBatchMutation,
+            databaseRecordMutationName: BenchmarkLayerContract.databaseRecordMutation
         )
     }
 
-    private static func measureUpdatePathFixedSummaries(
+    private static func measureUpdateWorkloadFixedSummaries(
         engine: any StorageEngine,
         container: DBContainer,
         iterations: Int,
         rounds: Int
     ) async throws -> [FixedIterationReporter.MeasurementSummary] {
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
         let layout = try await benchmarkStorageLayout(container: container)
         let reusedStore = try await container.store(for: BenchmarkItem.self)
         let seedCount = 1024
 
-        let rawUpdate = try await measureAsyncPhaseMedianWithSetup(
+        let directStorageUpdate = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await RawKV.cleanup(engine: engine)
-                let ids = try await RawKV.seedData(
+                try await DirectStorageWorkload.cleanup(engine: engine)
+                let ids = try await DirectStorageWorkload.seedData(
                     engine: engine,
                     count: seedCount,
-                    idPrefix: "update-profile-raw-r\(round)"
+                    idPrefix: "update-profile-direct-storage-r\(round)"
                 )
                 return PoolRoundState(pool: IterationIDPool(ids: ids))
             },
             operation: { state in
-                try await RawKV.updateOne(engine: engine, id: state.pool.next())
+                try await DirectStorageWorkload.updateOne(engine: engine, id: state.pool.next())
             }
         )
-        let layoutUpdate = try await measureAsyncPhaseMedianWithSetup(
+        let canonicalRecordUpdate = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await seedFrameworkLayoutStorageData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await seedCanonicalRecordStorageData(
                     engine: engine,
                     layout: layout,
                     count: seedCount,
-                    idPrefix: "update-profile-layout-r\(round)"
+                    idPrefix: "update-profile-canonical-storage-r\(round)"
                 )
                 return PoolRoundState(pool: IterationIDPool(ids: ids))
             },
             operation: { state in
-                try await frameworkLayoutStorageWrite(
+                try await canonicalRecordStorageWrite(
                     engine: engine,
                     layout: layout,
-                    id: state.pool.next(),
-                    isNewRecord: false
+                    id: state.pool.next()
                 )
             }
         )
@@ -1268,8 +1301,8 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "update-profile-ds-r\(round)"
@@ -1285,15 +1318,15 @@ enum ProfileBenchmark {
                 try await reusedStore.executeBatch(inserts: [item], deletes: [])
             }
         )
-        let productUpdate = try await measureAsyncPhaseMedianWithSetup(
+        let databaseRecordUpdate = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
-                    idPrefix: "update-profile-fw-r\(round)"
+                    idPrefix: "update-profile-database-record-r\(round)"
                 )
                 return PoolRoundState(pool: IterationIDPool(ids: ids))
             },
@@ -1303,16 +1336,16 @@ enum ProfileBenchmark {
                 item.name = "Updated Stable"
                 item.age = 42
                 item.score = 91.25
-                try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+                try await DatabaseRecordWorkload.updateOne(container: container, item: item)
             }
         )
 
         let divisor = UInt64(iterations)
         return [
-            .init(name: BenchmarkLayerContract.writeL1, totalNanos: rawUpdate / divisor),
-            .init(name: BenchmarkLayerContract.l2, totalNanos: layoutUpdate / divisor),
-            .init(name: BenchmarkLayerContract.writeL3, totalNanos: dataStoreUpdate / divisor),
-            .init(name: BenchmarkLayerContract.writeL4, totalNanos: productUpdate / divisor),
+            .init(name: BenchmarkLayerContract.directStorageMutation, totalNanoseconds: directStorageUpdate / divisor),
+            .init(name: BenchmarkLayerContract.canonicalRecordStorage, totalNanoseconds: canonicalRecordUpdate / divisor),
+            .init(name: BenchmarkLayerContract.dataStoreBatchMutation, totalNanoseconds: dataStoreUpdate / divisor),
+            .init(name: BenchmarkLayerContract.databaseRecordMutation, totalNanoseconds: databaseRecordUpdate / divisor),
         ]
     }
 
@@ -1329,16 +1362,16 @@ enum ProfileBenchmark {
         print("PROFILE: Update Path Lifecycle Overhead (\(iterations) iterations, median of \(rounds) rounds)")
         print(String(repeating: "=", count: 70))
 
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
-        let reusedContext = FDBContext(container: container)
+        let reusedContext = DatabaseContext(container: container)
         let clock = ContinuousClock()
         let seedCount = 1024
         var reusedSetupCounter = 0
         var freshSetupCounter = 0
 
         let contextInit = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            _ = FDBContext(container: container)
+            _ = DatabaseContext(container: container)
         }
         let reusedInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
             var item = BenchmarkItem()
@@ -1351,7 +1384,7 @@ enum ProfileBenchmark {
             reusedContext.rollback()
         }
         let freshInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            let context = FDBContext(container: container)
+            let context = DatabaseContext(container: container)
             var item = BenchmarkItem()
             item.id = "update-life-local-fresh-\(freshSetupCounter)"
             item.name = "Updated Stable"
@@ -1365,15 +1398,15 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "update-life-reused-r\(round)"
                 )
                 return ContextRoundState(
                     pool: IterationIDPool(ids: ids),
-                    context: FDBContext(container: container)
+                    context: DatabaseContext(container: container)
                 )
             },
             operation: { state in
@@ -1390,8 +1423,8 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "update-life-fresh-r\(round)"
@@ -1404,16 +1437,16 @@ enum ProfileBenchmark {
                 item.name = "Updated Stable"
                 item.age = 42
                 item.score = 91.25
-                try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+                try await DatabaseRecordWorkload.updateOne(container: container, item: item)
             }
         )
 
         let results = [
-            PhaseResult(name: "FDBContext.init()", iterations: iterations, totalNanos: contextInit),
-            PhaseResult(name: "FDBContext.insert()+rollback() reused", iterations: iterations, totalNanos: reusedInsertRollback),
-            PhaseResult(name: "FDBContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanos: freshInsertRollback),
-            PhaseResult(name: "FDBContext.save() reused context", iterations: iterations, totalNanos: reusedContextUpdate),
-            PhaseResult(name: "FDBContext.save() fresh context", iterations: iterations, totalNanos: freshContextUpdate),
+            PhaseResult(name: "DatabaseContext.init()", iterations: iterations, totalNanoseconds: contextInit),
+            PhaseResult(name: "DatabaseContext.insert()+rollback() reused", iterations: iterations, totalNanoseconds: reusedInsertRollback),
+            PhaseResult(name: "DatabaseContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanoseconds: freshInsertRollback),
+            PhaseResult(name: "DatabaseContext.save() reused context", iterations: iterations, totalNanoseconds: reusedContextUpdate),
+            PhaseResult(name: "DatabaseContext.save() fresh context", iterations: iterations, totalNanoseconds: freshContextUpdate),
         ]
 
         print("")
@@ -1428,12 +1461,12 @@ enum ProfileBenchmark {
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
             name: "fresh setup - reused setup",
-            deltaNanos: Int64(freshInsertRollback) - Int64(reusedInsertRollback),
+            deltaNanoseconds: Int64(freshInsertRollback) - Int64(reusedInsertRollback),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh save - reused save",
-            deltaNanos: Int64(freshContextUpdate) - Int64(reusedContextUpdate),
+            deltaNanoseconds: Int64(freshContextUpdate) - Int64(reusedContextUpdate),
             iterations: iterations
         )
         print("")
@@ -1452,48 +1485,47 @@ enum ProfileBenchmark {
         print("PROFILE: Update Hot Path Fixed Iteration (\(iterations) iterations, median of \(rounds) rounds)")
         print(String(repeating: "=", count: 70))
 
-        try await RawKV.cleanup(engine: engine)
-        try await FrameworkPostgreSQL.cleanup(container: container)
+        try await DirectStorageWorkload.cleanup(engine: engine)
+        try await DatabaseRecordWorkload.cleanup(container: container)
 
         let layout = try await benchmarkStorageLayout(container: container)
         let seedCount = 1024
         let reusedStore = try await container.store(for: BenchmarkItem.self)
 
-        let rawUpdate = try await measureAsyncPhaseMedianWithSetup(
+        let directStorageUpdate = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await RawKV.cleanup(engine: engine)
-                let ids = try await RawKV.seedData(
+                try await DirectStorageWorkload.cleanup(engine: engine)
+                let ids = try await DirectStorageWorkload.seedData(
                     engine: engine,
                     count: seedCount,
-                    idPrefix: "update-fixed-raw-r\(round)"
+                    idPrefix: "update-fixed-direct-storage-r\(round)"
                 )
                 return PoolRoundState(pool: IterationIDPool(ids: ids))
             },
             operation: { state in
-                try await RawKV.updateOne(engine: engine, id: state.pool.next())
+                try await DirectStorageWorkload.updateOne(engine: engine, id: state.pool.next())
             }
         )
-        let layoutUpdate = try await measureAsyncPhaseMedianWithSetup(
+        let canonicalRecordUpdate = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await seedFrameworkLayoutStorageData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await seedCanonicalRecordStorageData(
                     engine: engine,
                     layout: layout,
                     count: seedCount,
-                    idPrefix: "update-fixed-layout-r\(round)"
+                    idPrefix: "update-fixed-canonical-storage-r\(round)"
                 )
                 return PoolRoundState(pool: IterationIDPool(ids: ids))
             },
             operation: { state in
-                try await frameworkLayoutStorageWrite(
+                try await canonicalRecordStorageWrite(
                     engine: engine,
                     layout: layout,
-                    id: state.pool.next(),
-                    isNewRecord: false
+                    id: state.pool.next()
                 )
             }
         )
@@ -1501,8 +1533,8 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "update-fixed-ds-r\(round)"
@@ -1522,15 +1554,15 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "update-fixed-reused-r\(round)"
                 )
                 return ContextRoundState(
                     pool: IterationIDPool(ids: ids),
-                    context: FDBContext(container: container)
+                    context: DatabaseContext(container: container)
                 )
             },
             operation: { state in
@@ -1547,8 +1579,8 @@ enum ProfileBenchmark {
             iterations: iterations,
             rounds: rounds,
             setup: { round in
-                try await FrameworkPostgreSQL.cleanup(container: container)
-                let ids = try await FrameworkPostgreSQL.seedData(
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                let ids = try await DatabaseRecordWorkload.seedData(
                     container: container,
                     count: seedCount,
                     idPrefix: "update-fixed-fresh-r\(round)"
@@ -1561,16 +1593,16 @@ enum ProfileBenchmark {
                 item.name = "Updated Stable"
                 item.age = 42
                 item.score = 91.25
-                try await FrameworkPostgreSQL.updateOne(container: container, item: item)
+                try await DatabaseRecordWorkload.updateOne(container: container, item: item)
             }
         )
 
         let results = [
-            PhaseResult(name: "Raw KV update", iterations: iterations, totalNanos: rawUpdate),
-            PhaseResult(name: "Framework layout + storage update", iterations: iterations, totalNanos: layoutUpdate),
-            PhaseResult(name: "Generic DataStore batch path", iterations: iterations, totalNanos: dataStoreUpdate),
-            PhaseResult(name: "FDBContext.save() reused context", iterations: iterations, totalNanos: reusedContextUpdate),
-            PhaseResult(name: "FDBContext.save() fresh context", iterations: iterations, totalNanos: freshContextUpdate),
+            PhaseResult(name: "Direct storage update", iterations: iterations, totalNanoseconds: directStorageUpdate),
+            PhaseResult(name: "Canonical record storage update", iterations: iterations, totalNanoseconds: canonicalRecordUpdate),
+            PhaseResult(name: "DataStore batch mutation", iterations: iterations, totalNanoseconds: dataStoreUpdate),
+            PhaseResult(name: "DatabaseContext.save() reused context", iterations: iterations, totalNanoseconds: reusedContextUpdate),
+            PhaseResult(name: "DatabaseContext.save() fresh context", iterations: iterations, totalNanoseconds: freshContextUpdate),
         ]
 
         print("")
@@ -1584,18 +1616,18 @@ enum ProfileBenchmark {
         print("  Inferred overheads")
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
-            name: "generic-vs-layout storage update",
-            deltaNanos: Int64(dataStoreUpdate) - Int64(layoutUpdate),
+            name: "data-store-vs-canonical-storage update",
+            deltaNanoseconds: Int64(dataStoreUpdate) - Int64(canonicalRecordUpdate),
             iterations: iterations
         )
         printSignedDelta(
-            name: "product-vs-generic update",
-            deltaNanos: Int64(reusedContextUpdate) - Int64(dataStoreUpdate),
+            name: "database-record-vs-data-store update",
+            deltaNanoseconds: Int64(reusedContextUpdate) - Int64(dataStoreUpdate),
             iterations: iterations
         )
         printSignedDelta(
             name: "fresh-vs-reused update",
-            deltaNanos: Int64(freshContextUpdate) - Int64(reusedContextUpdate),
+            deltaNanoseconds: Int64(freshContextUpdate) - Int64(reusedContextUpdate),
             iterations: iterations
         )
         print("")
@@ -1603,21 +1635,20 @@ enum ProfileBenchmark {
 
     // MARK: - StorageKit Direct Operations
 
-    /// Layer 1 write helper: ad hoc key and opaque bytes only.
-    static func rawAdHocWrite(engine: any StorageEngine, id: String) async throws {
-        let key = rawAdHocKeyBytes(id: id)
-        let value: [UInt8] = Array(repeating: 0x42, count: 70)
+    /// Layer 1 write path: ad hoc key and opaque bytes only.
+    static func adHocStorageWrite(engine: any StorageEngine, id: String) async throws {
+        let key = adHocItemKey(id: id)
+        let value = ByteString(repeating: 0x42, count: 70)
         try await engine.withAutoCommit { tx in
-            tx.setValue(value, for: key)
+            try tx.setValue(value, for: key)
         }
     }
 
-    /// Layer 2 write helper: framework layout parity + DataAccess + ItemStorage.
-    static func frameworkLayoutStorageWrite(
+    /// Write through the canonical record storage contract.
+    static func canonicalRecordStorageWrite(
         engine: any StorageEngine,
         layout: BenchmarkStorageLayout,
-        id: String,
-        isNewRecord: Bool
+        id: String
     ) async throws {
         var item = BenchmarkItem()
         item.id = id
@@ -1626,65 +1657,64 @@ enum ProfileBenchmark {
         item.score = 85.5
 
         let data = try DataAccess.serialize(item)
-        let key = benchmarkKeyBytes(layout: layout, id: id)
+        let key = canonicalItemKey(layout: layout, id: id)
 
         try await engine.withAutoCommit { tx in
-            let storage = ItemStorage(
+            let storage = layout.itemStorageFactory.make(
                 transaction: tx,
                 blobsSubspace: layout.blobsSubspace
             )
-            try await storage.write(data, for: key, isNewRecord: isNewRecord)
+            try await storage.write(data, for: key)
         }
     }
 
-    /// Layer 1 delete helper: ad hoc key delete.
-    static func rawAdHocDelete(engine: any StorageEngine, id: String) async throws {
-        let key = rawAdHocKeyBytes(id: id)
+    /// Layer 1 delete path: ad hoc key delete.
+    static func adHocStorageDelete(engine: any StorageEngine, id: String) async throws {
+        let key = adHocItemKey(id: id)
         try await engine.withAutoCommit { tx in
-            tx.clear(key: key)
+            try tx.clear(key: key)
         }
     }
 
-    /// Layer 2 delete helper: framework layout parity + ItemStorage delete.
-    static func frameworkLayoutStorageDelete(
-        engine: any StorageEngine,
-        layout: BenchmarkStorageLayout,
-        id: String,
-        skipBlobCleanup: Bool
-    ) async throws {
-        let key = benchmarkKeyBytes(layout: layout, id: id)
-        try await engine.withAutoCommit { tx in
-            let storage = ItemStorage(
-                transaction: tx,
-                blobsSubspace: layout.blobsSubspace
-            )
-            try await storage.delete(for: key, skipBlobCleanup: skipBlobCleanup)
-        }
-    }
-
-    /// Layer 1 read helper: framework key only, no envelope decode or ItemStorage path.
-    static func rawFrameworkKeyRead(
+    /// Delete through the canonical record storage contract.
+    static func canonicalRecordStorageDelete(
         engine: any StorageEngine,
         layout: BenchmarkStorageLayout,
         id: String
     ) async throws {
-        let key = benchmarkKeyBytes(layout: layout, id: id)
+        let key = canonicalItemKey(layout: layout, id: id)
+        try await engine.withAutoCommit { tx in
+            let storage = layout.itemStorageFactory.make(
+                transaction: tx,
+                blobsSubspace: layout.blobsSubspace
+            )
+            try await storage.delete(for: key)
+        }
+    }
+
+    /// Read canonical-key presence without decoding the stored record.
+    static func canonicalKeyStorageRead(
+        engine: any StorageEngine,
+        layout: BenchmarkStorageLayout,
+        id: String
+    ) async throws {
+        let key = canonicalItemKey(layout: layout, id: id)
         try await engine.withAutoCommit { tx in
             _ = try await tx.getValue(for: key, snapshot: false)
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Canonical Record Storage
 
     @discardableResult
-    static func frameworkLayoutStorageDecodedRead(
+    static func canonicalRecordStorageRead(
         engine: any StorageEngine,
         layout: BenchmarkStorageLayout,
         id: String
     ) async throws -> BenchmarkItem? {
-        let key = benchmarkKeyBytes(layout: layout, id: id)
+        let key = canonicalItemKey(layout: layout, id: id)
         return try await engine.withAutoCommit { tx in
-            let storage = ItemStorage(
+            let storage = layout.itemStorageFactory.make(
                 transaction: tx,
                 blobsSubspace: layout.blobsSubspace
             )
@@ -1696,7 +1726,7 @@ enum ProfileBenchmark {
     }
 
     @discardableResult
-    static func seedFrameworkLayoutStorageData(
+    static func seedCanonicalRecordStorageData(
         engine: any StorageEngine,
         layout: BenchmarkStorageLayout,
         count: Int,
@@ -1709,7 +1739,7 @@ enum ProfileBenchmark {
         for batchStart in stride(from: 0, to: count, by: batchSize) {
             let end = min(batchStart + batchSize, count)
             try await engine.withTransaction { tx in
-                let storage = ItemStorage(
+                let storage = layout.itemStorageFactory.make(
                     transaction: tx,
                     blobsSubspace: layout.blobsSubspace
                 )
@@ -1720,14 +1750,13 @@ enum ProfileBenchmark {
                     var item = BenchmarkItem()
                     item.id = id
                     item.name = "User \(i)"
-                    item.age = 20 + (i % 60)
+                    item.age = Int64(20 + (i % 60))
                     item.score = Double(50 + (i % 50))
 
                     let data = try DataAccess.serialize(item)
                     try await storage.write(
                         data,
-                        for: benchmarkKeyBytes(layout: layout, id: id),
-                        isNewRecord: true
+                        for: canonicalItemKey(layout: layout, id: id)
                     )
                 }
             }
@@ -1736,22 +1765,34 @@ enum ProfileBenchmark {
         return ids
     }
 
-    /// Canonical framework layout helper for benchmark parity checks.
+    /// Resolve the canonical record layout used by benchmark parity checks.
     static func benchmarkStorageLayout(container: DBContainer) async throws -> BenchmarkStorageLayout {
         let subspace = try await container.resolveDirectory(for: BenchmarkItem.self)
         return BenchmarkStorageLayout(
             itemSubspace: subspace.subspace(SubspaceKey.items).subspace(BenchmarkItem.persistableType),
-            blobsSubspace: subspace.subspace(SubspaceKey.blobs)
+            blobsSubspace: subspace.subspace(SubspaceKey.blobs),
+            itemStorageFactory: container.itemStorageFactory
         )
     }
 
-    /// Canonical framework item key helper for benchmark parity checks.
-    static func benchmarkKeyBytes(layout: BenchmarkStorageLayout, id: String) -> [UInt8] {
-        layout.frameworkItemKey(id: id)
+    /// Construct a canonical item key used by benchmark parity checks.
+    static func canonicalItemKey(layout: BenchmarkStorageLayout, id: String) -> ByteString {
+        layout.canonicalItemKey(id: id)
     }
 
-    static func rawAdHocKeyBytes(id: String) -> [UInt8] {
-        Array("benchmark/items/\(id)".utf8)
+    static func adHocItemKey(id: String) -> ByteString {
+        let prefix = "benchmark/items/".utf8
+        return ByteString.copying(count: prefix.count + id.utf8.count) { destination in
+            var offset = 0
+            for byte in prefix {
+                destination[offset] = byte
+                offset += 1
+            }
+            for byte in id.utf8 {
+                destination[offset] = byte
+                offset += 1
+            }
+        }
     }
 
     private static func measurePhase(
@@ -1847,7 +1888,7 @@ enum ProfileBenchmark {
         return sorted[middle]
     }
 
-    private static func printGenericDeltaAnalysis(_ result: StrategyComparisonResult) {
+    private static func printAdjacentStrategyDeltas(_ result: StrategyComparisonResult) {
         let strategies = result.strategies
         guard strategies.count >= 2 else { return }
         let nameWidth = max(25, strategies.map(\.name.count).max() ?? 0)
@@ -1881,7 +1922,7 @@ enum ProfileBenchmark {
     private static func printThreeLayerDeltaAnalysis(_ result: StrategyComparisonResult) {
         let strategies = result.strategies
         guard strategies.count >= 3 else {
-            printGenericDeltaAnalysis(result)
+            printAdjacentStrategyDeltas(result)
             return
         }
 
@@ -1893,13 +1934,13 @@ enum ProfileBenchmark {
         print("  " + String(repeating: "-", count: 52))
         printLayerDelta(
             label: "L1 → L2",
-            description: BenchmarkLayerContract.l1ToL2Description,
+            description: BenchmarkLayerContract.storageEncodingTransitionDescription,
             from: l1,
             to: l2
         )
         printLayerDelta(
             label: "L2 → L3",
-            description: BenchmarkLayerContract.readL2ToL3Description,
+            description: BenchmarkLayerContract.dataStoreReadTransitionDescription,
             from: l2,
             to: l3
         )
@@ -1914,30 +1955,30 @@ enum ProfileBenchmark {
 
     private static func printStorageAndContextDeltaAnalysis(
         _ result: StrategyComparisonResult,
-        strictBaselineName: String? = nil,
-        storageBaselineName: String,
+        directStorageName: String? = nil,
+        canonicalStorageName: String,
         dataStoreName: String,
         contextName: String,
-        storageDescription: String = BenchmarkLayerContract.readL2ToL3Description,
-        contextDescription: String = BenchmarkLayerContract.readL3ToL4Description
+        storageDescription: String = BenchmarkLayerContract.dataStoreReadTransitionDescription,
+        contextDescription: String = BenchmarkLayerContract.contextReadTransitionDescription
     ) {
         guard
-            let storageBaseline = result.strategies.first(where: { $0.name == storageBaselineName }),
+            let canonicalStorage = result.strategies.first(where: { $0.name == canonicalStorageName }),
             let dataStore = result.strategies.first(where: { $0.name == dataStoreName }),
             let context = result.strategies.first(where: { $0.name == contextName })
         else {
-            printGenericDeltaAnalysis(result)
+            printAdjacentStrategyDeltas(result)
             return
         }
 
-        if let strictBaselineName,
-           let strictBaseline = result.strategies.first(where: { $0.name == strictBaselineName }) {
+        if let directStorageName,
+           let directStorage = result.strategies.first(where: { $0.name == directStorageName }) {
             print("  Strict Gap")
             print("  " + String(repeating: "-", count: 52))
             printLayerDelta(
-                label: "\(strictBaselineName) → \(contextName)",
-                description: "product-level delta",
-                from: strictBaseline,
+                label: "\(directStorageName) → \(contextName)",
+                description: "database record API delta",
+                from: directStorage,
                 to: context
             )
             print("")
@@ -1946,9 +1987,9 @@ enum ProfileBenchmark {
         print("  Storage Overhead")
         print("  " + String(repeating: "-", count: 52))
         printLayerDelta(
-            label: "\(storageBaselineName) → \(dataStoreName)",
+            label: "\(canonicalStorageName) → \(dataStoreName)",
             description: storageDescription,
-            from: storageBaseline,
+            from: canonicalStorage,
             to: dataStore
         )
         print("")
@@ -1964,45 +2005,45 @@ enum ProfileBenchmark {
         print("")
     }
 
-    private static func printWriteLayerDeltaAnalysis(
+    private static func printWriteWorkloadDeltaAnalysis(
         _ result: StrategyComparisonResult,
-        strictBaselineName: String,
-        storageBaselineName: String,
-        genericPathName: String,
-        productPathName: String
+        directStorageName: String,
+        canonicalStorageName: String,
+        dataStoreMutationName: String,
+        databaseRecordMutationName: String
     ) {
         guard
-            let strictBaseline = result.strategies.first(where: { $0.name == strictBaselineName }),
-            let storageBaseline = result.strategies.first(where: { $0.name == storageBaselineName }),
-            let genericPath = result.strategies.first(where: { $0.name == genericPathName }),
-            let productPath = result.strategies.first(where: { $0.name == productPathName })
+            let directStorage = result.strategies.first(where: { $0.name == directStorageName }),
+            let canonicalStorage = result.strategies.first(where: { $0.name == canonicalStorageName }),
+            let dataStoreMutation = result.strategies.first(where: { $0.name == dataStoreMutationName }),
+            let databaseRecordMutation = result.strategies.first(where: { $0.name == databaseRecordMutationName })
         else {
-            printGenericDeltaAnalysis(result)
+            printAdjacentStrategyDeltas(result)
             return
         }
 
         print("  Delta Analysis")
         print("  " + String(repeating: "-", count: 52))
         printLayerDelta(
-            label: "\(strictBaselineName) → \(storageBaselineName)",
-            description: BenchmarkLayerContract.l1ToL2Description,
-            from: strictBaseline,
-            to: storageBaseline
+            label: "\(directStorageName) → \(canonicalStorageName)",
+            description: BenchmarkLayerContract.storageEncodingTransitionDescription,
+            from: directStorage,
+            to: canonicalStorage
         )
         printLayerDelta(
-            label: "\(storageBaselineName) → \(genericPathName)",
-            description: BenchmarkLayerContract.writeL2ToL3Description,
-            from: storageBaseline,
-            to: genericPath
+            label: "\(canonicalStorageName) → \(dataStoreMutationName)",
+            description: BenchmarkLayerContract.dataStoreBatchTransitionDescription,
+            from: canonicalStorage,
+            to: dataStoreMutation
         )
         printLayerDelta(
-            label: "\(genericPathName) → \(productPathName)",
-            description: BenchmarkLayerContract.writeL3ToL4Description,
-            from: genericPath,
-            to: productPath
+            label: "\(dataStoreMutationName) → \(databaseRecordMutationName)",
+            description: BenchmarkLayerContract.databaseRecordMutationTransitionDescription,
+            from: dataStoreMutation,
+            to: databaseRecordMutation
         )
         print("")
-        print("  \(strictBaselineName) → \(productPathName) product-level strict gap: \(String(format: "%+.2f", productPath.metrics.latency.p50 - strictBaseline.metrics.latency.p50))ms")
+        print("  \(directStorageName) → \(databaseRecordMutationName) database record API gap: \(String(format: "%+.2f", databaseRecordMutation.metrics.latency.p50 - directStorage.metrics.latency.p50))ms")
         print("")
     }
 
@@ -2010,11 +2051,11 @@ enum ProfileBenchmark {
         title: String,
         result: StrategyComparisonResult,
         fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
-        storageBaselineName: String,
+        canonicalStorageName: String,
         dataStoreName: String,
         contextName: String,
-        targetThroughputOverheadPct: Double = 10.0,
-        targetFixedDeltaMicros: Double = 20.0,
+        targetThroughputOverheadPercent: Double = 10.0,
+        targetFixedDeltaMicroseconds: Double = 20.0,
         tolerance: Double = 0.05
     ) {
         print("  \(title)")
@@ -2023,10 +2064,10 @@ enum ProfileBenchmark {
             heading: "Storage Parity Summary",
             result: result,
             fixedMeasurements: fixedMeasurements,
-            baselineName: storageBaselineName,
+            baselineName: canonicalStorageName,
             candidateName: dataStoreName,
-            targetThroughputOverheadPct: targetThroughputOverheadPct,
-            targetFixedDeltaMicros: targetFixedDeltaMicros,
+            targetThroughputOverheadPercent: targetThroughputOverheadPercent,
+            targetFixedDeltaMicroseconds: targetFixedDeltaMicroseconds,
             tolerance: tolerance
         )
         printTargetAssessmentSection(
@@ -2035,50 +2076,50 @@ enum ProfileBenchmark {
             fixedMeasurements: fixedMeasurements,
             baselineName: dataStoreName,
             candidateName: contextName,
-            targetThroughputOverheadPct: targetThroughputOverheadPct,
-            targetFixedDeltaMicros: targetFixedDeltaMicros,
+            targetThroughputOverheadPercent: targetThroughputOverheadPercent,
+            targetFixedDeltaMicroseconds: targetFixedDeltaMicroseconds,
             tolerance: tolerance
         )
     }
 
-    private static func printWriteProductTargetAssessment(
+    private static func printDatabaseRecordMutationTargetAssessment(
         title: String,
         result: StrategyComparisonResult,
         fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
-        productBaselineName: String,
-        storageBaselineName: String,
-        genericPathName: String,
-        productPathName: String,
-        targetThroughputOverheadPct: Double = 10.0,
-        targetFixedDeltaMicros: Double = 20.0,
+        directStorageName: String,
+        canonicalStorageName: String,
+        dataStoreMutationName: String,
+        databaseRecordMutationName: String,
+        targetThroughputOverheadPercent: Double = 10.0,
+        targetFixedDeltaMicroseconds: Double = 20.0,
         tolerance: Double = 0.05
     ) {
         print("  \(title)")
         print("  " + String(repeating: "-", count: 52))
         printTargetAssessmentSection(
-            heading: BenchmarkLayerContract.productParitySummary,
+            heading: BenchmarkLayerContract.databaseRecordParitySummary,
             result: result,
             fixedMeasurements: fixedMeasurements,
-            baselineName: productBaselineName,
-            candidateName: productPathName,
-            targetThroughputOverheadPct: targetThroughputOverheadPct,
-            targetFixedDeltaMicros: targetFixedDeltaMicros,
+            baselineName: directStorageName,
+            candidateName: databaseRecordMutationName,
+            targetThroughputOverheadPercent: targetThroughputOverheadPercent,
+            targetFixedDeltaMicroseconds: targetFixedDeltaMicroseconds,
             tolerance: tolerance
         )
         printWriteDiagnosticAssessmentSection(
             heading: BenchmarkLayerContract.diagnosticBreakdown,
             result: result,
             fixedMeasurements: fixedMeasurements,
-            baselineName: storageBaselineName,
-            candidateName: genericPathName
+            baselineName: canonicalStorageName,
+            candidateName: dataStoreMutationName
         )
         printWriteDiagnosticAssessmentSection(
-            heading: "Product fast-path diagnostic",
+            heading: "Database record mutation diagnostic",
             result: result,
             fixedMeasurements: fixedMeasurements,
-            baselineName: genericPathName,
-            candidateName: productPathName,
-            expectedFastPathWin: true
+            baselineName: dataStoreMutationName,
+            candidateName: databaseRecordMutationName,
+            expectsDatabaseRecordAdvantage: true
         )
     }
 
@@ -2088,7 +2129,7 @@ enum ProfileBenchmark {
         fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
         baselineName: String,
         candidateName: String,
-        expectedFastPathWin: Bool = false
+        expectsDatabaseRecordAdvantage: Bool = false
     ) {
         guard
             let baseline = result.strategies.first(where: { $0.name == baselineName }),
@@ -2103,12 +2144,12 @@ enum ProfileBenchmark {
         }
 
         let throughputDelta = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
-        let fixedDelta = fixedCandidate.averageMicros - fixedBaseline.averageMicros
+        let fixedDelta = fixedCandidate.averageMicroseconds - fixedBaseline.averageMicroseconds
 
         print("  \(heading)")
         print("  " + String(repeating: "-", count: 52))
-        print("  \(baselineName) -> \(candidateName) throughput delta: \(formatWriteDiagnosticLine(delta: throughputDelta, unit: "%", expectedFastPathWin: expectedFastPathWin))")
-        print("  \(baselineName) -> \(candidateName) fixed delta: \(formatWriteDiagnosticLine(delta: fixedDelta, unit: " us/op", expectedFastPathWin: expectedFastPathWin))")
+        print("  \(baselineName) -> \(candidateName) throughput delta: \(formatWriteDiagnosticLine(delta: throughputDelta, unit: "%", expectsDatabaseRecordAdvantage: expectsDatabaseRecordAdvantage))")
+        print("  \(baselineName) -> \(candidateName) fixed delta: \(formatWriteDiagnosticLine(delta: fixedDelta, unit: " us/op", expectsDatabaseRecordAdvantage: expectsDatabaseRecordAdvantage))")
         print("")
     }
 
@@ -2118,8 +2159,8 @@ enum ProfileBenchmark {
         fixedMeasurements: [FixedIterationReporter.MeasurementSummary],
         baselineName: String,
         candidateName: String,
-        targetThroughputOverheadPct: Double = 10.0,
-        targetFixedDeltaMicros: Double = 20.0,
+        targetThroughputOverheadPercent: Double = 10.0,
+        targetFixedDeltaMicroseconds: Double = 20.0,
         tolerance: Double = 0.05
     ) {
         guard
@@ -2134,15 +2175,15 @@ enum ProfileBenchmark {
             return
         }
 
-        let throughputOverheadPct = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
-        let fixedDelta = fixedCandidate.averageMicros - fixedBaseline.averageMicros
+        let throughputOverheadPercent = ((baselineThroughput - candidateThroughput) / baselineThroughput) * 100
+        let fixedDelta = fixedCandidate.averageMicroseconds - fixedBaseline.averageMicroseconds
         print("  \(heading)")
         print("  " + String(repeating: "-", count: 52))
         print(
-            "  \(baselineName) -> \(candidateName) throughput target <= \(Int(targetThroughputOverheadPct))%: \(formatTargetLine(delta: throughputOverheadPct, unit: "%", tolerance: targetThroughputOverheadPct + tolerance))"
+            "  \(baselineName) -> \(candidateName) throughput target <= \(Int(targetThroughputOverheadPercent))%: \(formatTargetLine(delta: throughputOverheadPercent, unit: "%", tolerance: targetThroughputOverheadPercent + tolerance))"
         )
         print(
-            "  \(baselineName) -> \(candidateName) fixed target <= \(Int(targetFixedDeltaMicros)) us/op: \(formatTargetLine(delta: fixedDelta, unit: " us/op", tolerance: targetFixedDeltaMicros + tolerance))"
+            "  \(baselineName) -> \(candidateName) fixed target <= \(Int(targetFixedDeltaMicroseconds)) us/op: \(formatTargetLine(delta: fixedDelta, unit: " us/op", tolerance: targetFixedDeltaMicroseconds + tolerance))"
         )
         print("")
     }
@@ -2161,10 +2202,10 @@ enum ProfileBenchmark {
     private static func formatWriteDiagnosticLine(
         delta: Double,
         unit: String,
-        expectedFastPathWin: Bool
+        expectsDatabaseRecordAdvantage: Bool
     ) -> String {
         if delta < 0 {
-            let suffix = expectedFastPathWin ? " (expected product fast-path win)" : ""
+            let suffix = expectsDatabaseRecordAdvantage ? " (expected database record API advantage)" : ""
             return "faster by \(String(format: "%.2f", abs(delta)))\(unit)\(suffix)"
         }
         return "slower by \(String(format: "%.2f", delta))\(unit)"
@@ -2188,11 +2229,11 @@ enum ProfileBenchmark {
 
     private static func printSignedDelta(
         name: String,
-        deltaNanos: Int64,
+        deltaNanoseconds: Int64,
         iterations: Int
     ) {
-        let avgMicros = Double(deltaNanos) / Double(iterations) / 1000.0
+        let averageMicroseconds = Double(deltaNanoseconds) / Double(iterations) / 1000.0
         let padded = name.padding(toLength: max(40, name.count), withPad: " ", startingAt: 0)
-        print("  \(padded) \(String(format: "%+8.1f", avgMicros)) us")
+        print("  \(padded) \(String(format: "%+8.1f", averageMicroseconds)) us")
     }
 }

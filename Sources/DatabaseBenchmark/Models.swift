@@ -1,5 +1,5 @@
 import Foundation
-import Core
+import DatabaseKit
 
 @Persistable
 struct BenchmarkItem {
@@ -7,6 +7,6 @@ struct BenchmarkItem {
 
     var id: String = UUID().uuidString
     var name: String = ""
-    var age: Int = 0
+    var age: Int64 = 0
     var score: Double = 0.0
 }
