@@ -10,7 +10,6 @@ let package = Package(
         .package(path: "../database-kit"),
         .package(path: "../storage-kit"),
         .package(path: "../database-types"),
-        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.25.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.7.0"),
     ],
     targets: [
@@ -30,7 +29,6 @@ let package = Package(
                 .product(name: "StorageKitSystemClock", package: "storage-kit"),
                 .product(name: "DatabaseTypes", package: "database-types"),
                 .product(name: "PostgreSQLStorage", package: "storage-kit"),
-                .product(name: "PostgresNIO", package: "postgres-nio"),
                 .product(name: "Logging", package: "swift-log"),
             ]
         ),
