@@ -7,6 +7,15 @@ import DatabaseTypes
 import Logging
 import Synchronization
 
+// FIXME(INCOMPLETE_IMPLEMENTATION): This target does not compile against
+// database-framework >= 26.0803.x. Layer profiling reaches
+// `container.store(for:)` (now package-scoped), the removed
+// `withAutoCommit`, and the renamed `fetchByIDInTransaction`. There is no
+// production call path; this is a development-only benchmark. Success
+// requires porting the L3 phases onto a public BenchmarkFramework probe and
+// the current transaction API, then re-validating the profile phase labels
+// against BenchmarkLayerContract.
+
 private let logger = Logger(label: "benchmark.profile")
 
 // MARK: - Phase Timing

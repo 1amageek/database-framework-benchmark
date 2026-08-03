@@ -24,7 +24,7 @@ enum DatabaseRecordWorkload {
         return try await DBContainer.open(
             for: schema,
             configuration: .init(
-                backend: .custom(engine),
+                storageEngine: engine,
                 monotonicClock: SystemStorageClock(),
                 wallClock: RealtimeDatabaseWallClock()
             ),

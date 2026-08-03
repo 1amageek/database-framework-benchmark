@@ -7,6 +7,15 @@ import StorageKit
 import DatabaseEngine
 import DatabaseKit
 
+// FIXME(INCOMPLETE_IMPLEMENTATION): This target does not compile against
+// database-framework >= 26.0803.x. The L3 measurement rung reaches
+// `container.store(for:)`, which is now package-scoped to the framework.
+// There is no production call path; this is a development-only benchmark.
+// Success requires restoring the L3 rung through a public probe exported by
+// the framework's BenchmarkFramework product (which has package access) and
+// re-validating the per-transition parity targets before treating any run of
+// this benchmark as meaningful.
+
 typealias Strategy = (String, @Sendable () async throws -> Void)
 
 private final class CyclicIDPool: Sendable {
@@ -204,7 +213,7 @@ private func withBenchmarkEnvironment<T>(
                 } catch {
                     print("Cleanup warning: \(error)")
                 }
-                engine.shutdown()
+                await engine.shutdown()
                 return result
             } catch {
                 do {
@@ -213,7 +222,7 @@ private func withBenchmarkEnvironment<T>(
                 } catch {
                     print("Cleanup warning after failure: \(error)")
                 }
-                engine.shutdown()
+                await engine.shutdown()
                 throw error
             }
         } catch {
