@@ -48,25 +48,103 @@ jobs:
         working-directory: database-framework-benchmark
         run: |
           result_directory=/tmp/database-framework-benchmark-tests
-          result_bundle="$result_directory/BenchmarkHarness.xcresult"
-          log_path="$result_directory/BenchmarkHarness.log"
+          build_result="$result_directory/Build.xcresult"
+          test_result="$result_directory/Test.xcresult"
+          build_log="$result_directory/Build.log"
+          test_log="$result_directory/Test.log"
+          derived_data="$result_directory/DerivedData"
           mkdir -p "$result_directory"
           set -o pipefail
           perl -e 'alarm shift; exec @ARGV' 900 \
-            xcodebuild test \
+            xcodebuild build-for-testing \
               -scheme database-framework-benchmark-Package \
               -destination 'platform=macOS,arch=arm64' \
               -skipMacroValidation \
-              -derivedDataPath "$result_directory/DerivedData" \
-              -resultBundlePath "$result_bundle" \
+              -enableCodeCoverage NO \
+              -derivedDataPath "$derived_data" \
+              -resultBundlePath "$build_result" \
+              2>&1 | tee "$build_log"
+
+          xctestrun_paths="$(find "$derived_data/Build/Products" -maxdepth 1 \
+            -type f -name '*.xctestrun' -print)"
+          xctestrun_count="$(printf '%s\n' "$xctestrun_paths" \
+            | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [[ "$xctestrun_count" != "1" ]]; then
+            echo "error: expected one xctestrun file, found $xctestrun_count" >&2
+            printf '%s\n' "$xctestrun_paths" >&2
+            exit 1
+          fi
+
+          injected_xctestrun="$derived_data/Build/Products/BenchmarkHarness.environment.xctestrun"
+          cp "$xctestrun_paths" "$injected_xctestrun"
+          testing_library_path="$HOME/Library/Developer/Toolchains/${SWIFT_SNAPSHOT}.xctoolchain/usr/lib/swift/macosx/testing"
+          test -f "$testing_library_path/libTesting.dylib"
+
+          prepend_testing_library_path() {
+            local plist="$1"
+            local dictionary_path="$2"
+            local library_path="$3"
+            local value_path="$dictionary_path.DYLD_LIBRARY_PATH"
+            local existing_value=""
+
+            if ! plutil -extract "$dictionary_path" xml1 -o /dev/null \
+                "$plist" >/dev/null 2>&1; then
+              plutil -insert "$dictionary_path" -xml '<dict/>' "$plist"
+            fi
+            if existing_value="$(plutil -extract "$value_path" raw "$plist" 2>/dev/null)"; then
+              plutil -replace "$value_path" \
+                -string "$library_path:$existing_value" "$plist"
+            else
+              plutil -insert "$value_path" -string "$library_path" "$plist"
+            fi
+          }
+
+          configuration_index=0
+          target_count=0
+          while plutil -extract "TestConfigurations.$configuration_index.Name" raw \
+              "$injected_xctestrun" >/dev/null 2>&1; do
+            target_index=0
+            while plutil -extract \
+                "TestConfigurations.$configuration_index.TestTargets.$target_index.BlueprintName" \
+                raw "$injected_xctestrun" >/dev/null 2>&1; do
+              target_path="TestConfigurations.$configuration_index.TestTargets.$target_index"
+              prepend_testing_library_path \
+                "$injected_xctestrun" \
+                "$target_path.TestingEnvironmentVariables" \
+                "$testing_library_path"
+              target_count=$((target_count + 1))
+              target_index=$((target_index + 1))
+            done
+            configuration_index=$((configuration_index + 1))
+          done
+          if [[ "$target_count" != "2" ]]; then
+            echo "error: expected two test targets, found $target_count" >&2
+            exit 1
+          fi
+
+          perl -e 'alarm shift; exec @ARGV' 120 \
+            xcodebuild test-without-building \
+              -xctestrun "$injected_xctestrun" \
+              -destination 'platform=macOS,arch=arm64' \
+              -enableCodeCoverage NO \
+              -resultBundlePath "$test_result" \
               -only-testing:BenchmarkFrameworkTests \
               -only-testing:DatabaseBenchmarkTests \
-              2>&1 | tee "$log_path"
+              2>&1 | tee "$test_log"
 
       - name: Validate correctness result
         run: |
+          build_summary="$(xcrun xcresulttool get build-results \
+            --path /tmp/database-framework-benchmark-tests/Build.xcresult)"
+          jq -e '
+            .status == "succeeded"
+            and .errorCount == 0
+            and .warningCount == 0
+            and .analyzerWarningCount == 0
+          ' <<<"$build_summary"
+
           summary="$(xcrun xcresulttool get test-results summary \
-            --path /tmp/database-framework-benchmark-tests/BenchmarkHarness.xcresult)"
+            --path /tmp/database-framework-benchmark-tests/Test.xcresult)"
           jq -e '
             .result == "Passed"
             and .totalTestCount == 24
@@ -76,6 +154,13 @@ jobs:
             and .expectedFailures == 0
             and (.runtimeWarnings | length) == 0
           ' <<<"$summary"
+
+          if grep -En \
+              'Internal Error:|LLVM Profile Error:|warning: input verification failed' \
+              /tmp/database-framework-benchmark-tests/*.log; then
+            echo "error: internal tool failure detected" >&2
+            exit 1
+          fi
 
       - name: Upload correctness results
         if: always()
