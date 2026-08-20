@@ -1,20 +1,11 @@
 import Foundation
 import BenchmarkFramework
 import StorageKit
-import DatabaseEngine
+@_spi(Benchmarking) import DatabaseEngine
 import DatabaseKit
 import DatabaseTypes
 import Logging
 import Synchronization
-
-// FIXME(INCOMPLETE_IMPLEMENTATION): This target does not compile against
-// database-framework >= 26.0803.x. Layer profiling reaches
-// `container.store(for:)` (now package-scoped), the removed
-// `withAutoCommit`, and the renamed `fetchByIDInTransaction`. There is no
-// production call path; this is a development-only benchmark. Success
-// requires porting the L3 phases onto a public BenchmarkFramework probe and
-// the current transaction API, then re-validating the profile phase labels
-// against BenchmarkLayerContract.
 
 private let logger = Logger(label: "benchmark.profile")
 
@@ -24,9 +15,9 @@ private let logger = Logger(label: "benchmark.profile")
 ///
 /// The insert call chain:
 /// ```
-/// DatabaseContext.init → insert() → save()
-///   → TransactionRunner → StorageEngine.withAutoCommit
-///     → DatabaseRecordStorageCodec.encode()
+/// DBContainer.newContext() → insert() → save()
+///   → StorageTransactionExecutor.withTransaction
+///     → DataAccess.serialize()
 ///     → ItemEnvelope.serialize()
 ///     → transaction.setValue()
 ///     → IndexMaintenanceService.updateIndexes()
@@ -103,6 +94,15 @@ enum ProfileBenchmark {
         let deleteContext: DatabaseContext
     }
 
+    private static func openBenchmarkItemStore(
+        in container: DBContainer
+    ) async throws -> any DataStore {
+        try await DataStoreBenchmarkProbe.openDataStore(
+            for: BenchmarkItem.self,
+            in: container
+        )
+    }
+
     struct BenchmarkStorageLayout: Sendable {
         let itemSubspace: Subspace
         let blobsSubspace: Subspace
@@ -141,7 +141,7 @@ enum ProfileBenchmark {
         try await DirectStorageWorkload.cleanup(engine: engine)
         try await DatabaseRecordWorkload.cleanup(container: container)
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
 
         let strategies: [Strategy] = [
             (BenchmarkLayerContract.directStorageMutation, {
@@ -208,17 +208,17 @@ enum ProfileBenchmark {
 
         let clock = ContinuousClock()
 
-        // Phase 1: canonical DBRC serialization.
+        // Phase 1: canonical persisted-model serialization.
         var item = BenchmarkItem()
         item.name = "Alice"
         item.age = 30
         item.score = 85.5
 
         let recordEncode = try measurePhase(iterations: iterations, clock: clock) {
-            _ = try DatabaseRecordStorageCodec.encode(item)
+            _ = try DataAccess.serialize(item)
         }
 
-        let sampleBytes = try DatabaseRecordStorageCodec.encode(item)
+        let sampleBytes = try DataAccess.serialize(item)
 
         // Phase 2: checksum and canonical inline envelope serialization.
         let envelopeEncode = try measurePhase(iterations: iterations, clock: clock) {
@@ -253,21 +253,18 @@ enum ProfileBenchmark {
             _ = payload.count
         }
 
-        // Phase 4: canonical DBRC decode and model materialization.
+        // Phase 4: canonical persisted-model decode and materialization.
         let recordDecode = try measurePhase(iterations: iterations, clock: clock) {
-            let decoded = try DatabaseRecordStorageCodec.decode(
-                BenchmarkItem.self,
-                from: sampleBytes
-            )
+            let decoded: BenchmarkItem = try DataAccess.deserialize(sampleBytes)
             _ = decoded.id
         }
 
         // Print results
         let results = [
-            PhaseResult(name: "DBRC encode", iterations: iterations, totalNanoseconds: recordEncode),
+            PhaseResult(name: "Canonical record encode", iterations: iterations, totalNanoseconds: recordEncode),
             PhaseResult(name: "CRC32C + inline envelope encode", iterations: iterations, totalNanoseconds: envelopeEncode),
             PhaseResult(name: "Envelope decode/view + CRC32C", iterations: iterations, totalNanoseconds: envelopeDecode),
-            PhaseResult(name: "DBRC decode + materialize", iterations: iterations, totalNanoseconds: recordDecode),
+            PhaseResult(name: "Canonical record decode + materialize", iterations: iterations, totalNanoseconds: recordDecode),
         ]
 
         print("")
@@ -309,7 +306,7 @@ enum ProfileBenchmark {
         let databaseRecordID = "read-profile-database-record"
         let canonicalStorageID = "read-profile-canonical-storage"
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
 
         // Seed the application-facing record API.
         var databaseRecordItem = BenchmarkItem()
@@ -394,32 +391,34 @@ enum ProfileBenchmark {
         try await DatabaseRecordWorkload.insertOne(container: container, item: item)
 
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
-        let reusedContext = DatabaseContext(container: container)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
+        let reusedContext = DatabaseRecordWorkload.makeContext(in: container)
 
         let strategies: [Strategy] = [
             (BenchmarkLayerContract.canonicalRecordStorage, {
                 _ = try await canonicalRecordStorageRead(engine: engine, layout: layout, id: readID)
             }),
-            ("DataStore.fetchById + autoCommit parity", {
-                _ = try await reusedStore.withAutoCommit { transaction in
-                    try await reusedStore.fetchByIdInTransaction(
+            ("DataStore transaction fetch parity", {
+                _ = try await reusedStore.withTransaction(
+                    configuration: .default
+                ) { transaction in
+                    try await transaction.fetch(
                         BenchmarkItem.self,
-                        id: readID,
-                        transaction: transaction
+                        identifiedBy: readID
                     )
                 }
             }),
             (BenchmarkLayerContract.dataStoreRecordRead, {
                 _ = try await reusedStore.fetch(BenchmarkItem.self, id: readID)
             }),
-            ("Fresh DataStore.fetchById + autoCommit parity", {
-                let store = try await container.store(for: BenchmarkItem.self)
-                _ = try await store.withAutoCommit { transaction in
-                    try await store.fetchByIdInTransaction(
+            ("Fresh DataStore transaction fetch parity", {
+                let store = try await openBenchmarkItemStore(in: container)
+                _ = try await store.withTransaction(
+                    configuration: .default
+                ) { transaction in
+                    try await transaction.fetch(
                         BenchmarkItem.self,
-                        id: readID,
-                        transaction: transaction
+                        identifiedBy: readID
                     )
                 }
             }),
@@ -478,25 +477,26 @@ enum ProfileBenchmark {
         try await DatabaseRecordWorkload.insertOne(container: container, item: item)
 
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
-        let reusedContext = DatabaseContext(container: container)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
+        let reusedContext = DatabaseRecordWorkload.makeContext(in: container)
         let clock = ContinuousClock()
 
         let contextInit = try measurePhase(iterations: iterations, clock: clock) {
-            _ = DatabaseContext(container: container)
+            _ = DatabaseRecordWorkload.makeContext(in: container)
         }
         let storeInit = try await measureAsyncPhase(iterations: iterations) {
-            _ = try await container.store(for: BenchmarkItem.self)
+            _ = try await openBenchmarkItemStore(in: container)
         }
         let canonicalStorageDecode = try await measureAsyncPhase(iterations: iterations) {
             _ = try await canonicalRecordStorageRead(engine: engine, layout: layout, id: readID)
         }
-        let dataStoreAutoCommit = try await measureAsyncPhase(iterations: iterations) {
-            _ = try await reusedStore.withAutoCommit { transaction in
-                try await reusedStore.fetchByIdInTransaction(
+        let dataStoreTransaction = try await measureAsyncPhase(iterations: iterations) {
+            _ = try await reusedStore.withTransaction(
+                configuration: .default
+            ) { transaction in
+                try await transaction.fetch(
                     BenchmarkItem.self,
-                    id: readID,
-                    transaction: transaction
+                    identifiedBy: readID
                 )
             }
         }
@@ -516,10 +516,10 @@ enum ProfileBenchmark {
         }
 
         let results = [
-            PhaseResult(name: "DatabaseContext.init()", iterations: iterations, totalNanoseconds: contextInit),
-            PhaseResult(name: "DBContainer.store(for:)", iterations: iterations, totalNanoseconds: storeInit),
+            PhaseResult(name: "DBContainer.newContext()", iterations: iterations, totalNanoseconds: contextInit),
+            PhaseResult(name: "DataStoreBenchmarkProbe.openDataStore()", iterations: iterations, totalNanoseconds: storeInit),
             PhaseResult(name: "Canonical record storage", iterations: iterations, totalNanoseconds: canonicalStorageDecode),
-            PhaseResult(name: "DataStore.fetchById + autoCommit", iterations: iterations, totalNanoseconds: dataStoreAutoCommit),
+            PhaseResult(name: "DataStore transaction fetch", iterations: iterations, totalNanoseconds: dataStoreTransaction),
             PhaseResult(name: "DataStore.fetch()", iterations: iterations, totalNanoseconds: dataStoreFetch),
             PhaseResult(name: "DatabaseContext.fetch() reused context", iterations: iterations, totalNanoseconds: reusedContextRead),
             PhaseResult(name: "DatabaseContext.fetch() fresh context", iterations: iterations, totalNanoseconds: freshContextRead),
@@ -536,8 +536,8 @@ enum ProfileBenchmark {
         print("  Inferred overheads")
         print("  " + String(repeating: "-", count: 52))
         printSignedDelta(
-            name: "fetch() - fetchById+autoCommit",
-            deltaNanoseconds: Int64(dataStoreFetch) - Int64(dataStoreAutoCommit),
+            name: "fetch() - transaction fetch",
+            deltaNanoseconds: Int64(dataStoreFetch) - Int64(dataStoreTransaction),
             iterations: iterations
         )
         printSignedDelta(
@@ -560,7 +560,7 @@ enum ProfileBenchmark {
         print("PROFILE: Delete Path Layer-by-Layer")
         print(String(repeating: "=", count: 70))
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
 
         let strategies: [Strategy] = [
             (BenchmarkLayerContract.directStorageMutation, {
@@ -682,7 +682,7 @@ enum ProfileBenchmark {
             rounds: rounds,
             setup: { _ in
                 try await DatabaseRecordWorkload.cleanup(container: container)
-                let store = try await container.store(for: BenchmarkItem.self)
+                let store = try await openBenchmarkItemStore(in: container)
                 return DataStoreRoundState(store: store)
             },
             operation: { state in
@@ -701,8 +701,8 @@ enum ProfileBenchmark {
             setup: { _ in
                 try await DatabaseRecordWorkload.cleanup(container: container)
                 return DeleteContextRoundState(
-                    insertContext: DatabaseContext(container: container),
-                    deleteContext: DatabaseContext(container: container)
+                    insertContext: DatabaseRecordWorkload.makeContext(in: container),
+                    deleteContext: DatabaseRecordWorkload.makeContext(in: container)
                 )
             },
             operation: { state in
@@ -711,9 +711,9 @@ enum ProfileBenchmark {
                 item.name = "Temp"
                 item.age = 30
                 item.score = 50.0
-                state.insertContext.insert(item)
+                try state.insertContext.insert(item)
                 try await state.insertContext.save()
-                state.deleteContext.delete(item)
+                try state.deleteContext.delete(item)
                 try await state.deleteContext.save()
             }
         )
@@ -740,16 +740,16 @@ enum ProfileBenchmark {
 
         try await DatabaseRecordWorkload.cleanup(container: container)
 
-        let reusedInsertContext = DatabaseContext(container: container)
-        let reusedDeleteContext = DatabaseContext(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let reusedInsertContext = DatabaseRecordWorkload.makeContext(in: container)
+        let reusedDeleteContext = DatabaseRecordWorkload.makeContext(in: container)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
         let clock = ContinuousClock()
         let seedCount = max(1024, iterations + 32)
         var insertSetupCounter = 0
         var deleteSetupCounter = 0
 
         let contextInit = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            _ = DatabaseContext(container: container)
+            _ = DatabaseRecordWorkload.makeContext(in: container)
         }
         let reusedInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
             var item = BenchmarkItem()
@@ -758,19 +758,19 @@ enum ProfileBenchmark {
             item.age = 30
             item.score = 50.0
             insertSetupCounter += 1
-            reusedInsertContext.insert(item)
-            reusedInsertContext.rollback()
+            try reusedInsertContext.insert(item)
+            try reusedInsertContext.rollback()
         }
         let freshInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            let context = DatabaseContext(container: container)
+            let context = DatabaseRecordWorkload.makeContext(in: container)
             var item = BenchmarkItem()
             item.id = "delete-life-insert-fresh-\(insertSetupCounter)"
             item.name = "Temp"
             item.age = 30
             item.score = 50.0
             insertSetupCounter += 1
-            context.insert(item)
-            context.rollback()
+            try context.insert(item)
+            try context.rollback()
         }
         let reusedDeleteRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
             var item = BenchmarkItem()
@@ -779,19 +779,19 @@ enum ProfileBenchmark {
             item.age = 30
             item.score = 50.0
             deleteSetupCounter += 1
-            reusedDeleteContext.delete(item)
-            reusedDeleteContext.rollback()
+            try reusedDeleteContext.delete(item)
+            try reusedDeleteContext.rollback()
         }
         let freshDeleteRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            let context = DatabaseContext(container: container)
+            let context = DatabaseRecordWorkload.makeContext(in: container)
             var item = BenchmarkItem()
             item.id = "delete-life-delete-fresh-\(deleteSetupCounter)"
             item.name = "Temp"
             item.age = 30
             item.score = 50.0
             deleteSetupCounter += 1
-            context.delete(item)
-            context.rollback()
+            try context.delete(item)
+            try context.rollback()
         }
         let reusedInsertSave = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
@@ -800,7 +800,7 @@ enum ProfileBenchmark {
                 try await DatabaseRecordWorkload.cleanup(container: container)
                 return ContextRoundState(
                     pool: IterationIDPool(ids: []),
-                    context: DatabaseContext(container: container)
+                    context: DatabaseRecordWorkload.makeContext(in: container)
                 )
             },
             operation: { state in
@@ -809,7 +809,7 @@ enum ProfileBenchmark {
                 item.name = "Temp"
                 item.age = 30
                 item.score = 50.0
-                state.context.insert(item)
+                try state.context.insert(item)
                 try await state.context.save()
             }
         )
@@ -837,7 +837,7 @@ enum ProfileBenchmark {
                 return PoolRoundState(pool: IterationIDPool(ids: []))
             },
             operation: { _ in
-                let store = try await container.store(for: BenchmarkItem.self)
+                let store = try await openBenchmarkItemStore(in: container)
                 var item = BenchmarkItem()
                 item.id = UUID().uuidString
                 item.name = "Temp"
@@ -874,7 +874,7 @@ enum ProfileBenchmark {
                 )
                 return ContextRoundState(
                     pool: IterationIDPool(ids: ids),
-                    context: DatabaseContext(container: container)
+                    context: DatabaseRecordWorkload.makeContext(in: container)
                 )
             },
             operation: { state in
@@ -883,7 +883,7 @@ enum ProfileBenchmark {
                 item.name = "Temp"
                 item.age = 30
                 item.score = 50.0
-                state.context.delete(item)
+                try state.context.delete(item)
                 try await state.context.save()
             }
         )
@@ -924,7 +924,7 @@ enum ProfileBenchmark {
                 return PoolRoundState(pool: IterationIDPool(ids: ids))
             },
             operation: { state in
-                let store = try await container.store(for: BenchmarkItem.self)
+                let store = try await openBenchmarkItemStore(in: container)
                 var item = BenchmarkItem()
                 item.id = state.pool.next()
                 item.name = "Temp"
@@ -951,11 +951,11 @@ enum ProfileBenchmark {
         )
 
         let results = [
-            PhaseResult(name: "DatabaseContext.init()", iterations: iterations, totalNanoseconds: contextInit),
+            PhaseResult(name: "DBContainer.newContext()", iterations: iterations, totalNanoseconds: contextInit),
             PhaseResult(name: "DatabaseContext.insert()+rollback() reused", iterations: iterations, totalNanoseconds: reusedInsertRollback),
-            PhaseResult(name: "DatabaseContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanoseconds: freshInsertRollback),
+            PhaseResult(name: "DBContainer.newContext()+insert()+rollback() fresh", iterations: iterations, totalNanoseconds: freshInsertRollback),
             PhaseResult(name: "DatabaseContext.delete()+rollback() reused", iterations: iterations, totalNanoseconds: reusedDeleteRollback),
-            PhaseResult(name: "DatabaseContext.init()+delete()+rollback() fresh", iterations: iterations, totalNanoseconds: freshDeleteRollback),
+            PhaseResult(name: "DBContainer.newContext()+delete()+rollback() fresh", iterations: iterations, totalNanoseconds: freshDeleteRollback),
             PhaseResult(name: "DataStore.executeBatch() insert reused store", iterations: iterations, totalNanoseconds: reusedStoreInsert),
             PhaseResult(name: "DataStore.executeBatch() insert with store lookup", iterations: iterations, totalNanoseconds: lookupStoreInsert),
             PhaseResult(name: "DatabaseContext.save() insert reused", iterations: iterations, totalNanoseconds: reusedInsertSave),
@@ -1069,7 +1069,7 @@ enum ProfileBenchmark {
             rounds: rounds,
             setup: { _ in
                 try await DatabaseRecordWorkload.cleanup(container: container)
-                let store = try await container.store(for: BenchmarkItem.self)
+                let store = try await openBenchmarkItemStore(in: container)
                 return DataStoreRoundState(store: store)
             },
             operation: { state in
@@ -1089,8 +1089,8 @@ enum ProfileBenchmark {
             setup: { _ in
                 try await DatabaseRecordWorkload.cleanup(container: container)
                 return DeleteContextRoundState(
-                    insertContext: DatabaseContext(container: container),
-                    deleteContext: DatabaseContext(container: container)
+                    insertContext: DatabaseRecordWorkload.makeContext(in: container),
+                    deleteContext: DatabaseRecordWorkload.makeContext(in: container)
                 )
             },
             operation: { state in
@@ -1099,9 +1099,9 @@ enum ProfileBenchmark {
                 item.name = "Temp"
                 item.age = 30
                 item.score = 50.0
-                state.insertContext.insert(item)
+                try state.insertContext.insert(item)
                 try await state.insertContext.save()
-                state.deleteContext.delete(item)
+                try state.deleteContext.delete(item)
                 try await state.deleteContext.save()
             }
         )
@@ -1179,7 +1179,7 @@ enum ProfileBenchmark {
         let canonicalStorageID = "update-profile-canonical-storage"
         let databaseRecordID = "update-profile-database-record"
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
 
         try await canonicalRecordStorageWrite(
             engine: engine,
@@ -1266,7 +1266,7 @@ enum ProfileBenchmark {
         try await DatabaseRecordWorkload.cleanup(container: container)
 
         let layout = try await benchmarkStorageLayout(container: container)
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
         let seedCount = 1024
 
         let directStorageUpdate = try await measureAsyncPhaseMedianWithSetup(
@@ -1373,14 +1373,14 @@ enum ProfileBenchmark {
 
         try await DatabaseRecordWorkload.cleanup(container: container)
 
-        let reusedContext = DatabaseContext(container: container)
+        let reusedContext = DatabaseRecordWorkload.makeContext(in: container)
         let clock = ContinuousClock()
         let seedCount = 1024
         var reusedSetupCounter = 0
         var freshSetupCounter = 0
 
         let contextInit = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            _ = DatabaseContext(container: container)
+            _ = DatabaseRecordWorkload.makeContext(in: container)
         }
         let reusedInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
             var item = BenchmarkItem()
@@ -1389,19 +1389,19 @@ enum ProfileBenchmark {
             item.age = 42
             item.score = 91.25
             reusedSetupCounter += 1
-            reusedContext.insert(item)
-            reusedContext.rollback()
+            try reusedContext.insert(item)
+            try reusedContext.rollback()
         }
         let freshInsertRollback = try measurePhaseMedian(iterations: iterations, rounds: rounds, clock: clock) {
-            let context = DatabaseContext(container: container)
+            let context = DatabaseRecordWorkload.makeContext(in: container)
             var item = BenchmarkItem()
             item.id = "update-life-local-fresh-\(freshSetupCounter)"
             item.name = "Updated Stable"
             item.age = 42
             item.score = 91.25
             freshSetupCounter += 1
-            context.insert(item)
-            context.rollback()
+            try context.insert(item)
+            try context.rollback()
         }
         let reusedContextUpdate = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
@@ -1415,7 +1415,7 @@ enum ProfileBenchmark {
                 )
                 return ContextRoundState(
                     pool: IterationIDPool(ids: ids),
-                    context: DatabaseContext(container: container)
+                    context: DatabaseRecordWorkload.makeContext(in: container)
                 )
             },
             operation: { state in
@@ -1424,7 +1424,7 @@ enum ProfileBenchmark {
                 item.name = "Updated Stable"
                 item.age = 42
                 item.score = 91.25
-                state.context.insert(item)
+                try state.context.upsert(item)
                 try await state.context.save()
             }
         )
@@ -1451,9 +1451,9 @@ enum ProfileBenchmark {
         )
 
         let results = [
-            PhaseResult(name: "DatabaseContext.init()", iterations: iterations, totalNanoseconds: contextInit),
+            PhaseResult(name: "DBContainer.newContext()", iterations: iterations, totalNanoseconds: contextInit),
             PhaseResult(name: "DatabaseContext.insert()+rollback() reused", iterations: iterations, totalNanoseconds: reusedInsertRollback),
-            PhaseResult(name: "DatabaseContext.init()+insert()+rollback() fresh", iterations: iterations, totalNanoseconds: freshInsertRollback),
+            PhaseResult(name: "DBContainer.newContext()+insert()+rollback() fresh", iterations: iterations, totalNanoseconds: freshInsertRollback),
             PhaseResult(name: "DatabaseContext.save() reused context", iterations: iterations, totalNanoseconds: reusedContextUpdate),
             PhaseResult(name: "DatabaseContext.save() fresh context", iterations: iterations, totalNanoseconds: freshContextUpdate),
         ]
@@ -1499,7 +1499,7 @@ enum ProfileBenchmark {
 
         let layout = try await benchmarkStorageLayout(container: container)
         let seedCount = 1024
-        let reusedStore = try await container.store(for: BenchmarkItem.self)
+        let reusedStore = try await openBenchmarkItemStore(in: container)
 
         let directStorageUpdate = try await measureAsyncPhaseMedianWithSetup(
             iterations: iterations,
@@ -1571,7 +1571,7 @@ enum ProfileBenchmark {
                 )
                 return ContextRoundState(
                     pool: IterationIDPool(ids: ids),
-                    context: DatabaseContext(container: container)
+                    context: DatabaseRecordWorkload.makeContext(in: container)
                 )
             },
             operation: { state in
@@ -1580,7 +1580,7 @@ enum ProfileBenchmark {
                 item.name = "Updated Stable"
                 item.age = 42
                 item.score = 91.25
-                state.context.insert(item)
+                try state.context.upsert(item)
                 try await state.context.save()
             }
         )
@@ -1648,7 +1648,7 @@ enum ProfileBenchmark {
     static func adHocStorageWrite(engine: any StorageEngine, id: String) async throws {
         let key = adHocItemKey(id: id)
         let value = ByteString(repeating: 0x42, count: 70)
-        try await engine.withAutoCommit { tx in
+        try await engine.withTransaction { tx in
             try tx.setValue(value, for: key)
         }
     }
@@ -1668,7 +1668,7 @@ enum ProfileBenchmark {
         let data = try DataAccess.serialize(item)
         let key = canonicalItemKey(layout: layout, id: id)
 
-        try await engine.withAutoCommit { tx in
+        try await engine.withTransaction { tx in
             let storage = layout.itemStorageFactory.make(
                 transaction: tx,
                 blobsSubspace: layout.blobsSubspace
@@ -1680,7 +1680,7 @@ enum ProfileBenchmark {
     /// Layer 1 delete path: ad hoc key delete.
     static func adHocStorageDelete(engine: any StorageEngine, id: String) async throws {
         let key = adHocItemKey(id: id)
-        try await engine.withAutoCommit { tx in
+        try await engine.withTransaction { tx in
             try tx.clear(key: key)
         }
     }
@@ -1692,7 +1692,7 @@ enum ProfileBenchmark {
         id: String
     ) async throws {
         let key = canonicalItemKey(layout: layout, id: id)
-        try await engine.withAutoCommit { tx in
+        try await engine.withTransaction { tx in
             let storage = layout.itemStorageFactory.make(
                 transaction: tx,
                 blobsSubspace: layout.blobsSubspace
@@ -1708,7 +1708,7 @@ enum ProfileBenchmark {
         id: String
     ) async throws {
         let key = canonicalItemKey(layout: layout, id: id)
-        try await engine.withAutoCommit { tx in
+        try await engine.withTransaction { tx in
             _ = try await tx.getValue(for: key, snapshot: false)
         }
     }
@@ -1722,7 +1722,7 @@ enum ProfileBenchmark {
         id: String
     ) async throws -> BenchmarkItem? {
         let key = canonicalItemKey(layout: layout, id: id)
-        return try await engine.withAutoCommit { tx in
+        return try await engine.withTransaction { tx in
             let storage = layout.itemStorageFactory.make(
                 transaction: tx,
                 blobsSubspace: layout.blobsSubspace
@@ -1747,15 +1747,16 @@ enum ProfileBenchmark {
 
         for batchStart in stride(from: 0, to: count, by: batchSize) {
             let end = min(batchStart + batchSize, count)
+            let batchIDs = (batchStart..<end).map { index in
+                "\(idPrefix)-\(String(format: "%06d", index))"
+            }
             try await engine.withTransaction { tx in
                 let storage = layout.itemStorageFactory.make(
                     transaction: tx,
                     blobsSubspace: layout.blobsSubspace
                 )
-                for i in batchStart..<end {
-                    let id = "\(idPrefix)-\(String(format: "%06d", i))"
-                    ids.append(id)
-
+                for (offset, id) in batchIDs.enumerated() {
+                    let i = batchStart + offset
                     var item = BenchmarkItem()
                     item.id = id
                     item.name = "User \(i)"
@@ -1769,6 +1770,7 @@ enum ProfileBenchmark {
                     )
                 }
             }
+            ids.append(contentsOf: batchIDs)
         }
 
         return ids

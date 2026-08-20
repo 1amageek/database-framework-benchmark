@@ -1,116 +1,158 @@
 import Testing
+import BenchmarkFramework
 import StorageKit
-import DatabaseEngine
+@_spi(Benchmarking) import DatabaseEngine
 import DatabaseKit
 @testable import DatabaseBenchmark
 
 @Suite("ProfileBenchmark Layer Tests")
 struct ProfileBenchmarkLayerTests {
     private func makeContainer() async throws -> DBContainer {
-        let engine = InMemoryEngine()
-        let schema = Schema([BenchmarkItem.self], version: .init(1, 0, 0))
-        return try await DBContainer(
-            for: schema,
-            configuration: .init(backend: .custom(engine)),
-            runtimeConfiguration: try DatabaseRuntimeConfiguration(),
-            security: .disabled
-        )
+        try await DatabaseRecordWorkload.makeContainer(engine: InMemoryEngine())
+    }
+
+    private func withContainer(
+        _ operation: @Sendable (DBContainer) async throws -> Void
+    ) async throws {
+        let container = try await makeContainer()
+        do {
+            try await operation(container)
+            await container.shutdown()
+        } catch {
+            await container.shutdown()
+            throw error
+        }
     }
 
     @Test("canonical item key matches resolved items subspace packing")
     func canonicalItemKeyMatchesResolvedLayout() async throws {
-        let container = try await makeContainer()
-        let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
-        let id = "layout-test"
+        try await withContainer { container in
+            let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
+            let id = "layout-test"
 
-        let subspace = try await container.resolveDirectory(for: BenchmarkItem.self)
-        let expected = subspace
-            .subspace(SubspaceKey.items)
-            .subspace(BenchmarkItem.persistableType)
-            .pack(Tuple([id]))
+            let subspace = try await container.resolveDirectory(for: BenchmarkItem.self)
+            let expected = subspace
+                .subspace(SubspaceKey.items)
+                .subspace(BenchmarkItem.persistableType)
+                .pack(Tuple([id]))
 
-        #expect(ProfileBenchmark.canonicalItemKey(layout: layout, id: id) == expected)
+            #expect(ProfileBenchmark.canonicalItemKey(layout: layout, id: id) == expected)
+        }
     }
 
     @Test("canonical item key differs from the ad hoc storage key")
     func canonicalKeyDiffersFromAdHocStorageKey() async throws {
-        let container = try await makeContainer()
-        let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
-        let id = "read-key"
+        try await withContainer { container in
+            let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
+            let id = "read-key"
 
-        let canonicalKey = ProfileBenchmark.canonicalItemKey(layout: layout, id: id)
-        let adHocStorageKey = ProfileBenchmark.adHocItemKey(id: id)
+            let canonicalKey = ProfileBenchmark.canonicalItemKey(layout: layout, id: id)
+            let adHocStorageKey = ProfileBenchmark.adHocItemKey(id: id)
 
-        #expect(canonicalKey != adHocStorageKey)
+            #expect(canonicalKey != adHocStorageKey)
+        }
     }
 
     @Test("canonical record storage round-trips and deletes")
     func canonicalRecordStorageRoundTripsAndDeletes() async throws {
-        let engine = InMemoryEngine()
-        let schema = Schema([BenchmarkItem.self], version: .init(1, 0, 0))
-        let container = try await DBContainer(
-            for: schema,
-            configuration: .init(backend: .custom(engine)),
-            runtimeConfiguration: try DatabaseRuntimeConfiguration(),
-            security: .disabled
-        )
-        let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
-        let id = "roundtrip"
+        try await withContainer { container in
+            let engine = container.engine
+            let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
+            let id = "roundtrip"
 
-        try await ProfileBenchmark.canonicalRecordStorageWrite(
-            engine: engine,
-            layout: layout,
-            id: id
-        )
+            try await ProfileBenchmark.canonicalRecordStorageWrite(
+                engine: engine,
+                layout: layout,
+                id: id
+            )
 
-        let item = try await ProfileBenchmark.canonicalRecordStorageRead(
-            engine: engine,
-            layout: layout,
-            id: id
-        )
-        #expect(item?.id == id)
+            let item = try await ProfileBenchmark.canonicalRecordStorageRead(
+                engine: engine,
+                layout: layout,
+                id: id
+            )
+            #expect(item?.id == id)
 
-        try await ProfileBenchmark.canonicalRecordStorageDelete(
-            engine: engine,
-            layout: layout,
-            id: id
-        )
+            try await ProfileBenchmark.canonicalRecordStorageDelete(
+                engine: engine,
+                layout: layout,
+                id: id
+            )
 
-        let deleted = try await ProfileBenchmark.canonicalRecordStorageRead(
-            engine: engine,
-            layout: layout,
-            id: id
-        )
-        #expect(deleted == nil)
+            let deleted = try await ProfileBenchmark.canonicalRecordStorageRead(
+                engine: engine,
+                layout: layout,
+                id: id
+            )
+            #expect(deleted == nil)
+        }
     }
 
     @Test("seeded canonical records decode through the storage stack")
     func seededCanonicalRecordsRoundTrip() async throws {
-        let engine = InMemoryEngine()
-        let schema = Schema([BenchmarkItem.self], version: .init(1, 0, 0))
-        let container = try await DBContainer(
-            for: schema,
-            configuration: .init(backend: .custom(engine)),
-            runtimeConfiguration: try DatabaseRuntimeConfiguration(),
-            security: .disabled
-        )
-        let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
+        try await withContainer { container in
+            let engine = container.engine
+            let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
 
-        let ids = try await ProfileBenchmark.seedCanonicalRecordStorageData(
-            engine: engine,
-            layout: layout,
-            count: 3,
-            idPrefix: "seed-parity"
-        )
+            let ids = try await ProfileBenchmark.seedCanonicalRecordStorageData(
+                engine: engine,
+                layout: layout,
+                count: 3,
+                idPrefix: "seed-parity"
+            )
 
-        #expect(ids.count == 3)
+            #expect(ids.count == 3)
 
-        let item = try await ProfileBenchmark.canonicalRecordStorageRead(
-            engine: engine,
-            layout: layout,
-            id: ids[1]
-        )
-        #expect(item?.id == ids[1])
+            let item = try await ProfileBenchmark.canonicalRecordStorageRead(
+                engine: engine,
+                layout: layout,
+                id: ids[1]
+            )
+            #expect(item?.id == ids[1])
+        }
+    }
+
+    @Test("benchmark probe opens the canonical DataStore layer")
+    func benchmarkProbeOpensCanonicalDataStore() async throws {
+        try await withContainer { container in
+            let store = try await DataStoreBenchmarkProbe.openDataStore(
+                for: BenchmarkItem.self,
+                in: container
+            )
+            var item = BenchmarkItem()
+            item.id = "probe-roundtrip"
+            item.name = "Probe"
+
+            try await store.executeBatch(inserts: [item], deletes: [])
+            let fetched = try await store.fetch(
+                BenchmarkItem.self,
+                id: item.id
+            )
+
+            #expect(fetched?.id == item.id)
+            #expect(fetched?.name == item.name)
+        }
+    }
+
+    @Test("benchmark probe rejects models outside the container schema")
+    func benchmarkProbeRejectsUndeclaredModel() async throws {
+        try await withContainer { container in
+            do {
+                _ = try await DataStoreBenchmarkProbe.openDataStore(
+                    for: UndeclaredBenchmarkItem.self,
+                    in: container
+                )
+                Issue.record("Expected the benchmark probe to reject an undeclared model")
+            } catch let error as ContainerSchemaError {
+                #expect(
+                    error == .entityNotFound(
+                        UndeclaredBenchmarkItem.persistableType
+                    )
+                )
+            } catch {
+                Issue.record("Unexpected error: \(error)")
+            }
+        }
     }
 
     @Test("layer labels are stable and explicit about their contracts")

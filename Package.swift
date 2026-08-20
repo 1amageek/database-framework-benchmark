@@ -15,11 +15,20 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Use the adjacent local checkout so benchmark runs against in-flight framework changes.
+        // The benchmark-only probe is developed in the adjacent framework checkout.
         .package(path: "../database-framework", traits: ["PostgreSQL"]),
-        .package(path: "../database-kit"),
-        .package(path: "../storage-kit"),
-        .package(path: "../database-types"),
+        .package(
+            url: "https://github.com/1amageek/database-kit.git",
+            from: "26.0819.0"
+        ),
+        .package(
+            url: "https://github.com/1amageek/storage-kit.git",
+            from: "26.0820.0"
+        ),
+        .package(
+            url: "https://github.com/1amageek/database-types.git",
+            from: "26.0730.0"
+        ),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.7.0"),
         .package(
             url: "https://github.com/1amageek/swift-testing-heartbeat.git",
@@ -38,16 +47,15 @@ let package = Package(
             dependencies: [
                 .product(name: "DatabaseEngine", package: "database-framework"),
                 .product(name: "DatabaseRuntime", package: "database-framework"),
-                .product(
-                    name: "DatabaseServerFoundation",
-                    package: "database-framework"
-                ),
-                .product(name: "ScalarIndex", package: "database-framework"),
                 "BenchmarkFramework",
                 .product(name: "DatabaseKit", package: "database-kit"),
                 .product(name: "StorageKit", package: "storage-kit"),
                 .product(name: "StorageKitSystemClock", package: "storage-kit"),
                 .product(name: "DatabaseTypes", package: "database-types"),
+                .product(
+                    name: "DatabaseTypesFoundation",
+                    package: "database-types"
+                ),
                 .product(name: "PostgreSQLStorage", package: "storage-kit"),
                 .product(name: "Logging", package: "swift-log"),
             ]
@@ -56,6 +64,7 @@ let package = Package(
             name: "DatabaseBenchmarkTests",
             dependencies: [
                 "DatabaseBenchmark",
+                "BenchmarkFramework",
                 .product(name: "DatabaseEngine", package: "database-framework"),
                 .product(name: "DatabaseKit", package: "database-kit"),
                 .product(name: "StorageKit", package: "storage-kit"),

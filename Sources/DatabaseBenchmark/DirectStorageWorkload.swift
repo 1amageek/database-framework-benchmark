@@ -19,7 +19,7 @@ enum DirectStorageWorkload {
         utf8: "direct-storage/BenchmarkItem/"
     )
 
-    // MARK: - CRUD Operations (auto-commit, shared connection pool)
+    // MARK: - CRUD Operations (one-shot transactions, shared connection pool)
 
     static func insertOne(engine: any StorageEngine, id: String) async throws {
         let key = directStorageItemKey(id: id)

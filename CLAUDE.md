@@ -6,18 +6,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PostgreSQL benchmark comparing **direct storage operations** (StorageKit on PostgreSQL) vs **database record operations** (1amageek/database-framework stack). Measures CRUD operation overhead of the framework abstraction layer.
 
-## Current Status (2026-08-03)
+## Current Status (2026-08-20)
 
-**The DatabaseBenchmark target does not compile** against database-framework
-`26.0803.x`: the L3 (DataStore-layer) measurements reach `container.store(for:)`,
-which the framework made package-scoped, plus the removed `withAutoCommit` and
-the renamed `fetchByIDInTransaction`. `FIXME(INCOMPLETE_IMPLEMENTATION)` markers
-in `Entry.swift` and `ProfileBenchmark.swift` record the completion conditions:
-restore L3 through a public probe exported by the framework's
-`BenchmarkFramework` product, port to the current transaction API, and
-re-validate the per-transition parity targets. L1/L2/L4 measurement code and
-the mechanical API drift already repaired (DBConfiguration `storageEngine:`,
-async `engine.shutdown()`) are otherwise current.
+The source tracks the current adjacent database-framework checkout. L3
+measurements open the package-scoped DataStore layer through the framework's
+opt-in `DataStoreBenchmarkProbe` SPI. `BenchmarkFramework` is owned by this
+benchmark package and is absent from database-framework products and tests.
+Storage paths use `withTransaction`, database transactions use
+`fetch(_:identifiedBy:)`, runtime composition carries a stable
+`DatabaseExecutionRuntimeIdentity`, and `DBContainer` owns authoritative engine
+shutdown. Entity and field authorization are deliberately excluded through the
+framework's explicit testing SPI; never copy that security configuration into
+a production application. Do not treat source compatibility or a successful
+build as benchmark evidence; run the focused tests and the requested profile
+against an isolated PostgreSQL 16 database.
 
 ## Build & Run
 
@@ -28,12 +30,13 @@ swift build
 # Run benchmarks (requires running PostgreSQL)
 POSTGRES_HOST=localhost swift run DatabaseBenchmark
 
-# Start PostgreSQL via Docker
-docker run --rm -d -p 5432:5432 \
-  -e POSTGRES_PASSWORD=test \
-  -e POSTGRES_DB=benchmark_test \
-  postgres:16
+# Validate the production PostgreSQL paths without collecting measurements
+POSTGRES_HOST=localhost swift run DatabaseBenchmark --smoke
+
 ```
+
+Use an isolated PostgreSQL 16 instance and a disposable database. Do not run
+validation against a developer's long-running or default database.
 
 ### Environment Variables
 
@@ -47,7 +50,8 @@ docker run --rm -d -p 5432:5432 \
 
 ## Architecture
 
-- **Entry.swift** — `@main` entry point. Orchestrates profile and comparison benchmark scenarios using `BenchmarkRunner` from `BenchmarkFramework`.
+- **Entry.swift** — `@main` entry point. Orchestrates the PostgreSQL smoke validation and profile and comparison benchmark scenarios using `BenchmarkRunner` from `BenchmarkFramework`.
+- **BenchmarkWallClock.swift** — Native host adapter that supplies canonical absolute timestamps through `DatabaseTypesFoundation`.
 - **DirectStorageWorkload.swift** — Baseline (raw storage layer): direct key-value operations through `StorageTransactionExecutor` on the shared `StorageEngine`, without record encoding, identity resolution, or index maintenance.
 - **DatabaseRecordWorkload.swift** — Comparison target (framework record layer): canonical record operations through the public record API — `DBContainer → DatabaseContext → StorageKit → PostgreSQLStorage`. Records are stored as canonical storage frames via `PersistableStorageCodec`.
 - **ProfileBenchmark.swift** — Layered profile benchmarks (CPU phase breakdown; L1 direct storage mutation through L4 database record mutation).
@@ -59,15 +63,16 @@ docker run --rm -d -p 5432:5432 \
 ### Key Design Decisions
 
 - Both paths use explicit transactions to ensure fair comparison
-- Both workloads share the same `StorageEngine` and persistent store, eliminating backend and connection-pool bias
+- Both workloads use the `StorageEngine` exclusively owned by one `DBContainer`, eliminating backend and connection-pool bias
+- L3 access is available only through the benchmark-specific `DataStoreBenchmarkProbe`; production application access remains `DatabaseContext`
+- Entity and field authorization are disabled only through the explicit testing SPI so security-policy cost is outside this benchmark's layer contract
 - `BenchmarkRunner` from `BenchmarkFramework` handles warmup iterations, measurement, and reporting via `ConsoleReporter`
 
 ## Dependencies
 
-- **database-framework** (local path, PostgreSQL trait) — provides `DatabaseEngine`, `DatabaseRuntime`, `DatabaseServerFoundation`, `ScalarIndex`, `BenchmarkFramework`
-- **database-kit** (local path, `DatabaseKit`) — provides `@Persistable` macro and model infrastructure
-- **database-types** (local path, `DatabaseTypes`) — shared primitive types
-- **storage-kit** (local path, `StorageKit`, `StorageKitSystemClock`, `PostgreSQLStorage`) — storage engine abstraction for PostgreSQL
-- **postgres-nio** (remote, from: 1.25.0) — PostgreSQL driver
+- **database-framework** (local path, PostgreSQL trait) — provides `DatabaseEngine`, `DatabaseRuntime`, and the opt-in benchmark probe SPI
+- **database-kit** (tagged URL dependency, `DatabaseKit`) — provides `@Persistable` macro and model infrastructure
+- **database-types** (tagged URL dependency, `DatabaseTypes`, `DatabaseTypesFoundation`) — primitive values and native Foundation conversion
+- **storage-kit** (tagged URL dependency, `StorageKit`, `StorageKitSystemClock`, `PostgreSQLStorage`) — storage engine abstraction for PostgreSQL
 - **swift-log** (remote, from: 1.7.0) — logging
 - Swift tools 6.4 / macOS 26+

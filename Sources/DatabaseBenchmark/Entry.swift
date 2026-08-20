@@ -1,20 +1,11 @@
 import Foundation
-import Network
+import Darwin
 import Synchronization
 import BenchmarkFramework
 import PostgreSQLStorage
 import StorageKit
-import DatabaseEngine
+@_spi(Benchmarking) import DatabaseEngine
 import DatabaseKit
-
-// FIXME(INCOMPLETE_IMPLEMENTATION): This target does not compile against
-// database-framework >= 26.0803.x. The L3 measurement rung reaches
-// `container.store(for:)`, which is now package-scoped to the framework.
-// There is no production call path; this is a development-only benchmark.
-// Success requires restoring the L3 rung through a public probe exported by
-// the framework's BenchmarkFramework product (which has package access) and
-// re-validating the per-transition parity targets before treating any run of
-// this benchmark as meaningful.
 
 typealias Strategy = (String, @Sendable () async throws -> Void)
 
@@ -40,146 +31,166 @@ private final class CyclicIDPool: Sendable {
 struct BenchmarkApp {
     static func main() async {
         do {
-            let config = try BenchmarkConfig.fromEnvironment()
-
-            print("=== database-framework-benchmark ===")
-            print("Host: \(config.host):\(config.port)")
-            print("Database: \(config.database)")
-            print("")
-
-            // Parse run mode from arguments
-            let args = CommandLine.arguments
-            let profileOnly = args.contains("--profile")
-            let compareOnly = args.contains("--compare")
-            let runAll = !profileOnly && !compareOnly
-
-            var failures: [(String, Error)] = []
-
-            // --- Profile Benchmarks ---
-            if profileOnly || runAll {
-                do {
-                    try ProfileBenchmark.runPhaseBreakdown()
-                } catch {
-                    failures.append(("CPU Phase Breakdown", error))
-                    printBenchmarkFailure("CPU Phase Breakdown", error: error)
-                }
-                await runStep("Insert Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await ProfileBenchmark.run(
-                            runner: runner, engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Read Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await ProfileBenchmark.runReadProfile(
-                            runner: runner, engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Read Lifecycle Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await ProfileBenchmark.runReadLifecycleProfile(
-                            runner: runner, engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Read Fixed Iteration Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { _, engine, container in
-                        try await ProfileBenchmark.runReadFixedIterationProfile(
-                            engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Update Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await ProfileBenchmark.runUpdateProfile(
-                            runner: runner, engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Update Lifecycle Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { _, engine, container in
-                        try await ProfileBenchmark.runUpdateLifecycleProfile(
-                            engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Update Fixed Iteration Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { _, engine, container in
-                        try await ProfileBenchmark.runUpdateFixedIterationProfile(
-                            engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Delete Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await ProfileBenchmark.runDeleteProfile(
-                            runner: runner, engine: engine, container: container
-                        )
-                    }
-                }
-                await runStep("Delete Lifecycle Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { _, _, container in
-                        try await ProfileBenchmark.runDeleteLifecycleProfile(
-                            container: container
-                        )
-                    }
-                }
-                await runStep("Delete Fixed Iteration Profile", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { _, engine, container in
-                        try await ProfileBenchmark.runDeleteFixedIterationProfile(
-                            engine: engine, container: container
-                        )
-                    }
-                }
-            }
-
-            // --- Comparison Benchmarks ---
-            if compareOnly || runAll {
-                await runStep("Single Insert Compare", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await runSingleInsertBenchmark(runner: runner, engine: engine, container: container)
-                    }
-                }
-                await runStep("Batch Insert Compare", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await runBatchInsertBenchmark(runner: runner, engine: engine, container: container, batchSize: 100)
-                    }
-                }
-                await runStep("Point Read Compare", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await runPointReadBenchmark(runner: runner, engine: engine, container: container)
-                    }
-                }
-                await runStep("Point Update Compare", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await runUpdateBenchmark(runner: runner, engine: engine, container: container)
-                    }
-                }
-                await runStep("Point Delete Compare", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await runPointDeleteBenchmark(runner: runner, engine: engine, container: container)
-                    }
-                }
-                await runStep("Insert + Delete Compare", failures: &failures) {
-                    try await withBenchmarkEnvironment(config: config) { runner, engine, container in
-                        try await runDeleteBenchmark(runner: runner, engine: engine, container: container)
-                    }
-                }
-            }
-
-            print("Benchmark complete.")
-            if !failures.isEmpty {
-                print("")
-                print("Benchmark finished with failures:")
-                for (name, error) in failures {
-                    print(" - \(name): \(error)")
-                }
-            }
+            try await run()
         } catch {
-            print("Benchmark startup failed: \(error)")
+            fputs("Benchmark failed: \(error)\n", stderr)
+            exit(EXIT_FAILURE)
         }
+    }
+
+    private static func run() async throws {
+        let config = try BenchmarkConfig.fromEnvironment()
+
+        print("=== database-framework-benchmark ===")
+        print("Host: \(config.host):\(config.port)")
+        print("Database: \(config.database)")
+        print("")
+
+        // Parse run mode from arguments
+        let args = CommandLine.arguments
+        let profileOnly = args.contains("--profile")
+        let compareOnly = args.contains("--compare")
+        let smokeOnly = args.contains("--smoke")
+        let runAll = !profileOnly && !compareOnly && !smokeOnly
+
+        var failures: [(String, Error)] = []
+
+        if smokeOnly {
+            await runStep("PostgreSQL Smoke", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { _, engine, container in
+                    try await runPostgreSQLSmoke(
+                        engine: engine,
+                        container: container
+                    )
+                }
+            }
+        }
+
+        // --- Profile Benchmarks ---
+        if profileOnly || runAll {
+            do {
+                try ProfileBenchmark.runPhaseBreakdown()
+            } catch {
+                failures.append(("CPU Phase Breakdown", error))
+                printBenchmarkFailure("CPU Phase Breakdown", error: error)
+            }
+            await runStep("Insert Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await ProfileBenchmark.run(
+                        runner: runner, engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Read Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await ProfileBenchmark.runReadProfile(
+                        runner: runner, engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Read Lifecycle Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await ProfileBenchmark.runReadLifecycleProfile(
+                        runner: runner, engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Read Fixed Iteration Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { _, engine, container in
+                    try await ProfileBenchmark.runReadFixedIterationProfile(
+                        engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Update Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await ProfileBenchmark.runUpdateProfile(
+                        runner: runner, engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Update Lifecycle Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { _, engine, container in
+                    try await ProfileBenchmark.runUpdateLifecycleProfile(
+                        engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Update Fixed Iteration Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { _, engine, container in
+                    try await ProfileBenchmark.runUpdateFixedIterationProfile(
+                        engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Delete Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await ProfileBenchmark.runDeleteProfile(
+                        runner: runner, engine: engine, container: container
+                    )
+                }
+            }
+            await runStep("Delete Lifecycle Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { _, _, container in
+                    try await ProfileBenchmark.runDeleteLifecycleProfile(
+                        container: container
+                    )
+                }
+            }
+            await runStep("Delete Fixed Iteration Profile", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { _, engine, container in
+                    try await ProfileBenchmark.runDeleteFixedIterationProfile(
+                        engine: engine, container: container
+                    )
+                }
+            }
+        }
+
+        // --- Comparison Benchmarks ---
+        if compareOnly || runAll {
+            await runStep("Single Insert Compare", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await runSingleInsertBenchmark(runner: runner, engine: engine, container: container)
+                }
+            }
+            await runStep("Batch Insert Compare", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await runBatchInsertBenchmark(runner: runner, engine: engine, container: container, batchSize: 100)
+                }
+            }
+            await runStep("Point Read Compare", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await runPointReadBenchmark(runner: runner, engine: engine, container: container)
+                }
+            }
+            await runStep("Point Update Compare", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await runUpdateBenchmark(runner: runner, engine: engine, container: container)
+                }
+            }
+            await runStep("Point Delete Compare", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await runPointDeleteBenchmark(runner: runner, engine: engine, container: container)
+                }
+            }
+            await runStep("Insert + Delete Compare", failures: &failures) {
+                try await withBenchmarkEnvironment(config: config) { runner, engine, container in
+                    try await runDeleteBenchmark(runner: runner, engine: engine, container: container)
+                }
+            }
+        }
+
+        if !failures.isEmpty {
+            print("")
+            print("Benchmark finished with failures:")
+            for (name, error) in failures {
+                print(" - \(name): \(error)")
+            }
+            throw BenchmarkRuntimeError.benchmarkStepsFailed(
+                count: failures.count
+            )
+        }
+        print("Benchmark complete.")
     }
 }
 
@@ -192,10 +203,6 @@ private func withBenchmarkEnvironment<T>(
 
     for attempt in 1...attempts {
         do {
-            guard await isEndpointReachable(host: config.host, port: config.port) else {
-                throw BenchmarkRuntimeError.postgresUnavailable(host: config.host, port: config.port)
-            }
-
             let container = try await DatabaseRecordWorkload.makeContainer(config: config)
             let engine = container.engine
             let runner = BenchmarkRunner(config: .init(
@@ -207,31 +214,33 @@ private func withBenchmarkEnvironment<T>(
             do {
                 try await warmupBenchmarkEnvironment(engine: engine, container: container)
                 let result = try await body(runner, engine, container)
-                do {
-                    try await DirectStorageWorkload.cleanup(engine: engine)
-                    try await DatabaseRecordWorkload.cleanup(container: container)
-                } catch {
-                    print("Cleanup warning: \(error)")
-                }
-                await engine.shutdown()
+                try await DirectStorageWorkload.cleanup(engine: engine)
+                try await DatabaseRecordWorkload.cleanup(container: container)
+                await container.shutdown()
                 return result
             } catch {
+                let operationError = error
                 do {
                     try await DirectStorageWorkload.cleanup(engine: engine)
                     try await DatabaseRecordWorkload.cleanup(container: container)
                 } catch {
-                    print("Cleanup warning after failure: \(error)")
+                    let cleanupError = error
+                    await container.shutdown()
+                    throw BenchmarkCleanupError(
+                        operationError: operationError,
+                        cleanupError: cleanupError
+                    )
                 }
-                await engine.shutdown()
-                throw error
+                await container.shutdown()
+                throw operationError
             }
         } catch {
             lastError = error
             if attempt < attempts {
-                let backoffSeconds = UInt64(attempt)
+                let backoffSeconds = attempt
                 print("Benchmark environment attempt \(attempt) failed: \(error)")
                 print("Retrying after \(backoffSeconds)s...")
-                try await Task.sleep(nanoseconds: backoffSeconds * 1_000_000_000)
+                try await Task.sleep(for: .seconds(backoffSeconds))
                 continue
             }
         }
@@ -281,53 +290,131 @@ private func printBenchmarkFailure(_ name: String, error: Error) {
 }
 
 private enum BenchmarkRuntimeError: Error {
+    case benchmarkStepsFailed(count: Int)
     case environmentSetupFailed
-    case postgresUnavailable(host: String, port: Int)
+    case smokeExpectationFailed(String)
 }
 
-private func isEndpointReachable(host: String, port: Int) async -> Bool {
-    guard let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
-        return false
-    }
+private struct BenchmarkCleanupError: Error, CustomStringConvertible {
+    let operationError: Error
+    let cleanupError: Error
 
-    return await withCheckedContinuation { continuation in
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
-        let queue = DispatchQueue(label: "benchmark.postgres.preflight")
-        let finished = Mutex(false)
-
-        @Sendable func complete(_ value: Bool) {
-            let shouldResume = finished.withLock { state in
-                if state {
-                    return false
-                }
-                state = true
-                return true
-            }
-            guard shouldResume else { return }
-            connection.cancel()
-            continuation.resume(returning: value)
-        }
-
-        connection.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                complete(true)
-            case .failed(_), .cancelled:
-                complete(false)
-            default:
-                break
-            }
-        }
-
-        connection.start(queue: queue)
-
-        queue.asyncAfter(deadline: .now() + 1.0) {
-            complete(false)
-        }
+    var description: String {
+        "Benchmark operation failed with \(operationError); cleanup also failed with \(cleanupError)"
     }
 }
 
 // MARK: - Scenarios
+
+private func runPostgreSQLSmoke(
+    engine: any StorageEngine,
+    container: DBContainer
+) async throws {
+    let directStorageID = "smoke-direct-\(UUID().uuidString)"
+    try await DirectStorageWorkload.insertOne(
+        engine: engine,
+        id: directStorageID
+    )
+    guard try await DirectStorageWorkload.readOne(
+        engine: engine,
+        id: directStorageID
+    ) else {
+        throw BenchmarkRuntimeError.smokeExpectationFailed(
+            "Direct storage did not return the inserted value"
+        )
+    }
+    try await DirectStorageWorkload.updateOne(
+        engine: engine,
+        id: directStorageID
+    )
+    try await DirectStorageWorkload.deleteOne(
+        engine: engine,
+        id: directStorageID
+    )
+    guard !(try await DirectStorageWorkload.readOne(
+        engine: engine,
+        id: directStorageID
+    )) else {
+        throw BenchmarkRuntimeError.smokeExpectationFailed(
+            "Direct storage returned a deleted value"
+        )
+    }
+
+    var databaseRecord = BenchmarkItem()
+    databaseRecord.id = "smoke-record-\(UUID().uuidString)"
+    databaseRecord.name = "Inserted"
+    try await DatabaseRecordWorkload.insertOne(
+        container: container,
+        item: databaseRecord
+    )
+    guard let insertedRecord = try await DatabaseRecordWorkload.readOne(
+        container: container,
+        id: databaseRecord.id
+    ), insertedRecord.name == databaseRecord.name else {
+        throw BenchmarkRuntimeError.smokeExpectationFailed(
+            "Database record API did not return the inserted model"
+        )
+    }
+    databaseRecord.name = "Updated"
+    try await DatabaseRecordWorkload.updateOne(
+        container: container,
+        item: databaseRecord
+    )
+    guard let updatedRecord = try await DatabaseRecordWorkload.readOne(
+        container: container,
+        id: databaseRecord.id
+    ), updatedRecord.name == databaseRecord.name else {
+        throw BenchmarkRuntimeError.smokeExpectationFailed(
+            "Database record API did not return the updated model"
+        )
+    }
+    try await DatabaseRecordWorkload.deleteOne(
+        container: container,
+        id: databaseRecord.id
+    )
+    guard (try await DatabaseRecordWorkload.readOne(
+        container: container,
+        id: databaseRecord.id
+    )) == nil else {
+        throw BenchmarkRuntimeError.smokeExpectationFailed(
+            "Database record API returned a deleted model"
+        )
+    }
+
+    let dataStore = try await DataStoreBenchmarkProbe.openDataStore(
+        for: BenchmarkItem.self,
+        in: container
+    )
+    var dataStoreRecord = BenchmarkItem()
+    dataStoreRecord.id = "smoke-datastore-\(UUID().uuidString)"
+    dataStoreRecord.name = "DataStore"
+    try await dataStore.executeBatch(
+        inserts: [dataStoreRecord],
+        deletes: []
+    )
+    guard let fetchedDataStoreRecord = try await dataStore.fetch(
+        BenchmarkItem.self,
+        id: dataStoreRecord.id
+    ), fetchedDataStoreRecord.name == dataStoreRecord.name else {
+        throw BenchmarkRuntimeError.smokeExpectationFailed(
+            "DataStore did not return the inserted model"
+        )
+    }
+    try await dataStore.executeBatch(
+        inserts: [],
+        deletes: [dataStoreRecord]
+    )
+    guard (try await dataStore.fetch(
+        BenchmarkItem.self,
+        id: dataStoreRecord.id
+    )) == nil else {
+        throw BenchmarkRuntimeError.smokeExpectationFailed(
+            "DataStore returned a deleted model"
+        )
+    }
+
+    print("PostgreSQL smoke validation passed.")
+}
 
 private func runSingleInsertBenchmark(
     runner _: BenchmarkRunner,
@@ -409,7 +496,10 @@ private func runPointReadBenchmark(
 ) async throws {
     try await DirectStorageWorkload.cleanup(engine: engine)
     try await DatabaseRecordWorkload.cleanup(container: container)
-    let dataStore = try await container.store(for: BenchmarkItem.self)
+    let dataStore = try await DataStoreBenchmarkProbe.openDataStore(
+        for: BenchmarkItem.self,
+        in: container
+    )
 
     let pointReadRunner = BenchmarkRunner(config: .init(
         warmupIterations: 15,
@@ -483,7 +573,10 @@ private func runUpdateBenchmark(
 ) async throws {
     try await DirectStorageWorkload.cleanup(engine: engine)
     try await DatabaseRecordWorkload.cleanup(container: container)
-    let dataStore = try await container.store(for: BenchmarkItem.self)
+    let dataStore = try await DataStoreBenchmarkProbe.openDataStore(
+        for: BenchmarkItem.self,
+        in: container
+    )
     let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
     let updateRunner = BenchmarkRunner(config: .init(
         warmupIterations: 15,
@@ -575,7 +668,10 @@ private func runDeleteBenchmark(
 ) async throws {
     try await DirectStorageWorkload.cleanup(engine: engine)
     try await DatabaseRecordWorkload.cleanup(container: container)
-    let dataStore = try await container.store(for: BenchmarkItem.self)
+    let dataStore = try await DataStoreBenchmarkProbe.openDataStore(
+        for: BenchmarkItem.self,
+        in: container
+    )
     let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
     let deleteRunner = BenchmarkRunner(config: .init(
         warmupIterations: 15,
@@ -657,7 +753,10 @@ private func runPointDeleteBenchmark(
 ) async throws {
     try await DirectStorageWorkload.cleanup(engine: engine)
     try await DatabaseRecordWorkload.cleanup(container: container)
-    let dataStore = try await container.store(for: BenchmarkItem.self)
+    let dataStore = try await DataStoreBenchmarkProbe.openDataStore(
+        for: BenchmarkItem.self,
+        in: container
+    )
     let layout = try await ProfileBenchmark.benchmarkStorageLayout(container: container)
     let deleteRunner = BenchmarkRunner(config: .init(
         warmupIterations: 15,
