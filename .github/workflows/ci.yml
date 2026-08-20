@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOOLCHAINS: org.swift.64202607231a
+  SWIFT_SNAPSHOT: swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a
+  SWIFT_SNAPSHOT_URL: https://download.swift.org/swift-6.4.x-branch/xcode/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a-osx.pkg
+
+jobs:
+  correctness:
+    name: Benchmark harness correctness
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - name: Checkout benchmark package
+        uses: actions/checkout@v7
+        with:
+          path: database-framework-benchmark
+
+      - name: Checkout framework
+        uses: actions/checkout@v7
+        with:
+          repository: 1amageek/database-framework
+          path: database-framework
+
+      - name: Install pinned Swift toolchain
+        run: |
+          toolchain_package="$RUNNER_TEMP/${SWIFT_SNAPSHOT}-osx.pkg"
+          toolchain_root="$HOME/Library/Developer/Toolchains/${SWIFT_SNAPSHOT}.xctoolchain"
+          curl -fL --retry 3 -o "$toolchain_package" "$SWIFT_SNAPSHOT_URL"
+          installer -pkg "$toolchain_package" -target CurrentUserHomeDirectory
+          test -x "$toolchain_root/usr/bin/swift"
+          platform_linker="$(env -u TOOLCHAINS xcrun --find ld)"
+          ln -sf "$platform_linker" "$toolchain_root/usr/bin/ld"
+          test -x "$toolchain_root/usr/bin/ld"
+          echo "$toolchain_root/usr/bin" >> "$GITHUB_PATH"
+
+      - name: Test benchmark harness correctness
+        working-directory: database-framework-benchmark
+        run: |
+          result_directory=/tmp/database-framework-benchmark-tests
+          result_bundle="$result_directory/BenchmarkHarness.xcresult"
+          log_path="$result_directory/BenchmarkHarness.log"
+          mkdir -p "$result_directory"
+          set -o pipefail
+          perl -e 'alarm shift; exec @ARGV' 900 \
+            xcodebuild test \
+              -scheme database-framework-benchmark-Package \
+              -destination 'platform=macOS,arch=arm64' \
+              -derivedDataPath "$result_directory/DerivedData" \
+              -resultBundlePath "$result_bundle" \
+              -only-testing:BenchmarkFrameworkTests \
+              -only-testing:DatabaseBenchmarkTests \
+              2>&1 | tee "$log_path"
+
+      - name: Validate correctness result
+        run: |
+          summary="$(xcrun xcresulttool get test-results summary \
+            --path /tmp/database-framework-benchmark-tests/BenchmarkHarness.xcresult)"
+          jq -e '
+            .result == "Passed"
+            and .totalTestCount == 24
+            and .passedTests == 24
+            and .failedTests == 0
+            and .skippedTests == 0
+            and .expectedFailures == 0
+            and (.runtimeWarnings | length) == 0
+          ' <<<"$summary"
+
+      - name: Upload correctness results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-harness-xcresult
+          path: /tmp/database-framework-benchmark-tests
+          if-no-files-found: error
