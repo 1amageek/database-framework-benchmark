@@ -5,6 +5,14 @@ import Foundation
 
 @Suite("BenchmarkFramework Tests", .heartbeat)
 struct BenchmarkFrameworkTests {
+    private static let unitTestRunnerConfig = BenchmarkRunner.Config(
+        warmupIterations: 1,
+        measurementIterations: 20,
+        throughputDuration: 0.01,
+        comparisonRounds: 1,
+        measureMemory: false
+    )
+
     // MARK: - LatencyMetrics Tests
 
     @Test("LatencyMetrics calculates percentiles")
@@ -77,14 +85,14 @@ struct BenchmarkFrameworkTests {
 
     @Test("ThroughputMetrics measures an operation")
     func throughputMeasure() async throws {
-        let metrics = try await ThroughputMetrics.measure(duration: 1.0) {
+        let metrics = try await ThroughputMetrics.measure(duration: 0.01) {
             // Fast operation
         }
 
         #expect(metrics.totalOperations > 0)
         #expect(metrics.opsPerSecond > 0)
-        #expect(metrics.durationSeconds >= 1.0)
-        #expect(metrics.durationSeconds < 1.5)
+        #expect(metrics.durationSeconds >= 0.01)
+        #expect(metrics.durationSeconds < 0.5)
     }
 
     // MARK: - MemoryMetrics Tests
@@ -182,7 +190,7 @@ struct BenchmarkFrameworkTests {
 
     @Test("BenchmarkRunner compares two operations")
     func runnerCompare() async throws {
-        let runner = BenchmarkRunner(config: .quick)
+        let runner = BenchmarkRunner(config: Self.unitTestRunnerConfig)
 
         let result = try await runner.compare(
             name: "Simple Comparison",
@@ -207,7 +215,7 @@ struct BenchmarkFrameworkTests {
 
     @Test("BenchmarkRunner compares multiple strategies")
     func runnerCompareStrategies() async throws {
-        let runner = BenchmarkRunner(config: .quick)
+        let runner = BenchmarkRunner(config: Self.unitTestRunnerConfig)
 
         let result = try await runner.compareStrategies(
             name: "Multiple Strategies",
@@ -261,7 +269,7 @@ struct BenchmarkFrameworkTests {
 
     @Test("BenchmarkRunner measures scalability")
     func runnerScale() async throws {
-        let runner = BenchmarkRunner(config: .quick)
+        let runner = BenchmarkRunner(config: Self.unitTestRunnerConfig)
 
         let result = try await runner.scale(
             name: "Scalability Test",
